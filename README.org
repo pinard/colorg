@@ -1,8 +1,7 @@
 #+TITLE: ColOrg — Collaborative tools for Emacs Org
 #+OPTIONS: H:2
-#+SETUPFILE: ~/fp/notes/setup/nodeemacs.org
+#+SETUPFILE: ~/fp/notes/setup/nodemacs.org
 #+INCLUDE: ~/fp/notes/setup/jqindex.org
-
-Here is the skeleton of a project aimed at real-time collaboration between people editing Org files using Emacs Org mode.  The initial goal is to lay out some analysis about how we could first get some solution, with the intent of refining it later, rather than directly aiming the ideal setup.  To that end, I'll try to save into the Wiki ongoing pointers and related exchanges taken from the Org mailing list.  Once we got enough material and opinions, we might start the work more seriously.
+Here is the skeleton of a project aimed at real-time collaboration between people editing Org files using Emacs Org mode.  The initial goal is to lay out some analysis about how we could first get some solution, with the intent of refining it later, rather than directly aiming the ideal setup.  The [[https://github.com/pinard/ColOrg/wiki][Colorg Wiki]] contains exchanges taken from the Org mailing list, ongoing pointers, related matters, as well as [[https://github.com/pinard/ColOrg/wiki/Usage][usage instructions]].
 
 François

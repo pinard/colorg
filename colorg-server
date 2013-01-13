@@ -1,0 +1,253 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright © 2013 Progiciels Bourbeau-Pinard inc.
+# François Pinard <pinard@iro.umontreal.ca>, 2013.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.  */
+
+"""\
+ColOrg is a real-time collaborative editing tool meant for Emacs
+Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
+
+This is the ColOrg server.
+"""
+
+__metaclass__ = type
+import gevent
+from gevent import socket
+import hashlib
+import json
+import sys
+
+md5_empty = 'd41d8cd98f00b204e9800998ecf8427e'
+
+
+class Main:
+    host = '0.0.0.0'
+    port = 7997
+
+    def main(self, *arguments):
+        """\
+ColOrg server.  Orchestrate collobaration between many ColOrg clients.
+
+Usage: colorg-server [OPTION]...
+
+Options:
+  -h HOST   Listen for connections on HOST instead of 0.0.0.0.
+  -p PORT   Listen for connections on PORT rather than on 7997.
+"""
+
+        # Decode options.
+        import getopt
+        options, arguments = getopt.getopt(arguments, 'h:p:')
+        for option, value in options:
+            if option == '-h':
+                self.host = value
+            elif option == '-p':
+                self.port = int(value)
+        assert not arguments, arguments
+
+        # Start it all.
+        try:
+            gevent.spawn(self.listener).join()
+        except KeyboardInterrupt:
+            sys.stderr.write('\n')
+
+    def listener(self):
+        "To each new connection, assign a Client."
+        handle = socket.socket()
+        handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+        handle.bind((self.host, self.port))
+        handle.listen(1)
+        self.log("ColOrg server accepting connections on %s, port %d.",
+                 self.host, self.port)
+        while True:
+            handle2, address = handle.accept()
+            Client(handle2, address).start()
+
+    def log(self, format, *arguments):
+        sys.stderr.write('%s\n' % (format % arguments).rstrip())
+
+
+class Client(gevent.Greenlet):
+
+    def __init__(self, handle, address):
+        super(Client, self).__init__()
+        self.input = handle.makefile()
+        self.output = handle.makefile('w', 0)
+        self.host, self.port = address
+        self.log("Incoming connection.")
+        self.user = 0
+        # List of (RESOURCE, START, END, STRING) waiting to be polled.
+        self.queue = []
+
+    def _run(self):
+
+        # Process incoming requests.
+        while True:
+            line = self.input.readline()
+            if not line:
+                self.log("Disconnected.")
+                break
+            try:
+                request = json.loads(line)
+            except ValueError, exception:
+                self.log('%s', exception)
+                request = None
+            result = self.dispatch(request)
+            text = json.dumps(result)
+            assert '\n' not in text, repr(text)
+            self.output.write(text + '\n')
+
+        # Leave all resources.
+        for resource in Resource.registry.itervalues():
+            if self in resource.clients:
+                resource.clients.remove(self)
+
+    def dispatch(self, request):
+        if request:
+            if isinstance(request, list):
+                action = request[0]
+                arguments = request[1:]
+            else:
+                action = request
+                arguments = ()
+        else:
+            action = None
+        processor = getattr(self, 'do_%s' % action, None)
+        if processor is None:
+            self.log("Unrecognized action in %s", request)
+            return False
+        return processor(*arguments)
+
+    def do_assert(self, resource, start, string):
+        resource = Resource.get(resource)
+        if resource is None:
+            return "Resource not found."
+        found = resource.contents[start:start + len(string)]
+        if found != string:
+            self.log("Expected %r in %s, found %r.", string, resource, found)
+
+    def do_change(self, resource, start, end, string):
+        resource = Resource.get(resource)
+        if resource is None:
+            return "Resource not found."
+        if self not in resource.clients:
+            return "Resource is not monitored."
+        for client in resource.clients:
+            client.queue.append((resource.ordinal, start, end, string))
+        resource.contents = (resource.contents[:start] + string
+                             + resource.contents[end:])
+
+    def do_create(self, name):
+        if not isinstance(name, (str, unicode)):
+            return "Name should be a string."
+        if Resource.get(name) is not None:
+            return "Resource name already taken."
+        return Resource(name).ordinal
+
+    def do_join(self, resource, md5sum):
+        resource = Resource.get(resource)
+        if resource is None:
+            return "Resource not found."
+        if self in resource.clients:
+            return "Already monitoring."
+        if md5sum == md5_empty:
+            self.queue.append((0, 0, resource.contents))
+        elif md5sum != resource.md5sum():
+            return "Checksums do not match."
+        resource.clients.append(self)
+        return resource.ordinal
+
+    def do_leave(self, resource):
+        resource = Resource.get(resource)
+        if resource is None:
+            return "Resource not found."
+        if self not in resource.clients:
+            return "Was not monitoring."
+        resource.clients.remove(self)
+
+    def do_login(self, name):
+        if self.user:
+            return "Already logged in."
+        if name in User.registry.values():
+            return "User name already taken."
+        self.user = User.ordinal
+        User.ordinal += 1
+        User.registry[self.user] = name
+        return self.user
+
+    def do_logout(self):
+        if self.user:
+            del User.registry[self.user]
+            self.user = 0
+            return 0
+        return "Not logged in."
+
+    def do_resources(self):
+        return [[key, resource.name]
+                for key, resource in sorted(Resource.registry.items())]
+
+    def do_poll(self, *subrequests):
+        for request in subrequests:
+            result = self.dispatch(request)
+            if isinstance(result, (str, unicode)):
+                return result
+        queue = self.queue
+        self.queue = []
+        return queue
+
+    def do_users(self):
+        return [[key, value]
+                for key, value in sorted(User.registry.items())]
+
+    def log(self, format, *arguments):
+        run.log('%s.%d: ' + format, self.host, self.port, *arguments)
+
+
+class Resource:
+    ordinal = 0
+    registry = {}
+
+    def __init__(self, name):
+        self.name = name
+        self.ordinal = Resource.ordinal
+        Resource.ordinal += 1
+        Resource.registry[self.ordinal] = self
+        self.contents = ''
+        self.clients = []
+
+    @staticmethod
+    def get(name):
+        if isinstance(name, int):
+            return Resource.registry.get(name)
+        for key, resource in Resource.registry.iteritems():
+            if name == resource.name:
+                return resource
+
+    def md5sum(self):
+        return hashlib.md5(self.contents).hexdigest()
+
+
+class User:
+    ordinal = 1
+    registry = {0: "Anonymous"}
+
+
+run = Main()
+main = run.main
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])

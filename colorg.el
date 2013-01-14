@@ -56,47 +56,67 @@ kept on one of more servers.")
   "Timer used to detect the quiescence of Emacs.")
 
 (defvar colorg-outgoing-list nil
-  "Accumulated change instructions meant to be broadcasted.
+  "Accumulated alter commands meant to be broadcasted.
 These are sent to the server whenever Emacs gets idle for a jiffie.")
 
 (defun colorg-after-change-routine (start end deleted)
-  "After any buffer change, tell the server about the change to do.
-These instructions are accumulated and sent at regular intervals."
+  "After any buffer change, tell the server about the alter to do.
+These commands are accumulated and sent at regular intervals."
   (when colorg-current-resource
-    ;; Combine a pure insert with a previous change, whenever possible.
+    ;; Combine a pure insert with a previous alter, whenever possible.
     (let ((info (and colorg-outgoing-list
                      (zerop deleted)
-                     (eq (caar colorg-outgoing-list) 'change)
-                     (cdar colorg-outgoing-list))))
+                     (string-equal (caar colorg-outgoing-list) "alter")
+                     (= (cadar colorg-outgoing-list) colorg-current-resource)
+                     (cddar colorg-outgoing-list))))
       (if (and info (= start (+ (car info) (length (caddr info)))))
           (setcar (cddr info)
                   (concat (caddr info) (buffer-substring start end)))
-        (push (list 'change start (+ start deleted) (buffer-substring start end))
+        (push (list "alter" colorg-current-resource start (+ start deleted)
+                    (buffer-substring start end))
               colorg-outgoing-list)))))
 
 (defun colorg-before-change-routine (start end)
   "Before any buffer change, instruct the server to assert previous contents.
-These instructions are accumulated and sent at regular intervals.
+These commands are accumulated and sent at regular intervals.
 This is merely a debugging feature, which may be inhibited to get some speed."
   (when colorg-current-resource
     (unless (= start end)
-      (push (list 'assert start end (buffer-substring start end))
+      (push (list "check" start end (buffer-substring start end))
             colorg-outgoing-list))))
-
-(require 'json)
 
 (defun colorg-idle-routine ()
   "Whenever Emacs gets idle, round-trip with the synchronization server.
-We push out accumulated instructions.  Then, we get externally triggered
-change instructions from the server and execute them all."
-  (let ((outgoing (if colorg-outgoing-list
-                      (cons 'poll (nreverse colorg-outgoing-list))
-                    'poll)))
-    (message (json-encode outgoing)))
-  (setq colorg-outgoing-list nil)
-  (sleep-for 0.5))
+We push out accumulated commands.  Then, we get externally
+triggered alter commands from the server and execute them all."
+  (let* ((outgoing (if colorg-outgoing-list
+                       (cons 'poll (nreverse colorg-outgoing-list))
+                     'poll))
+         (results (colorg-round-trip outgoing)))
+    (message "%S" results)))
 
 ;;; Communication protocol.
+
+(defvar colorg-buffer-name "*ColOrg*")
+(defvar colorg-process nil)
+(defvar colorg-buffer nil)
+
+(require 'json)
+
+(defun colorg-round-trip (data)
+  (unless (processp colorg-process)
+    (setq colorg-buffer (get-buffer-create colorg-buffer-name))
+    (setq colorg-process
+          (open-network-stream "essai" colorg-buffer "localhost" 7997)))
+  (save-excursion
+    (set-buffer colorg-buffer)
+    (erase-buffer)
+    (process-send-string nil (concat (json-encode data) "\n"))
+    (while (not (search-forward "\n" nil t))
+      (accept-process-output colorg-process)
+      (goto-char (point-min)))
+    (goto-char (point-min))
+    (let ((json-array-type 'list)) (json-read))))
 
 ;;; Activation and deactivation.
 
@@ -114,7 +134,14 @@ change instructions from the server and execute them all."
 
 (defun colorg-local-enable ()
   (interactive)
-  (setq colorg-current-resource t)
+  (let ((reply (colorg-round-trip
+                (list "create" (read-string "Resource name? ")))))
+    (unless (string-equal (car reply) "done")
+      (error "%S" reply))
+    (setq colorg-current-resource (cadr reply)))
+  (push (list "alter" colorg-current-resource (point-min) (point-min)
+              (buffer-substring (point-min) (point-max)))
+        colorg-outgoing-list)
   (message "ColOrg enabled."))
 
 (defun colorg-local-disable ()

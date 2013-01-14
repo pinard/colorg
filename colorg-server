@@ -34,7 +34,12 @@ import sys
 md5_empty = 'd41d8cd98f00b204e9800998ecf8427e'
 
 
+class Error(Exception):
+    pass
+
+
 class Main:
+    debug = False
     host = '0.0.0.0'
     port = 7997
 
@@ -45,15 +50,18 @@ ColOrg server.  Orchestrate collobaration between many ColOrg clients.
 Usage: colorg-server [OPTION]...
 
 Options:
+  -d        Debug all communication.
   -h HOST   Listen for connections on HOST instead of 0.0.0.0.
   -p PORT   Listen for connections on PORT rather than on 7997.
 """
 
         # Decode options.
         import getopt
-        options, arguments = getopt.getopt(arguments, 'h:p:')
+        options, arguments = getopt.getopt(arguments, 'dh:p:')
         for option, value in options:
-            if option == '-h':
+            if option == '-d':
+                self.debug = True
+            elif option == '-h':
                 self.host = value
             elif option == '-p':
                 self.port = int(value)
@@ -71,44 +79,55 @@ Options:
         handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         handle.bind((self.host, self.port))
         handle.listen(1)
-        self.log("ColOrg server accepting connections on %s, port %d.",
-                 self.host, self.port)
+        self.echo("ColOrg server accepting connections on %s, port %d.",
+                  self.host, self.port)
         while True:
             handle2, address = handle.accept()
             Client(handle2, address).start()
 
-    def log(self, format, *arguments):
+    def echo(self, format, *arguments):
         sys.stderr.write('%s\n' % (format % arguments).rstrip())
 
 
 class Client(gevent.Greenlet):
+    name = "Anonymous"
+    ordinal = 0
+    registry = {}
 
     def __init__(self, handle, address):
+        self.ordinal = Client.ordinal
+        Client.ordinal += 1
+        Client.registry[self.ordinal] = self
         super(Client, self).__init__()
         self.input = handle.makefile()
         self.output = handle.makefile('w', 0)
         self.host, self.port = address
-        self.log("Incoming connection.")
-        self.user = 0
-        # List of (RESOURCE, START, END, STRING) waiting to be polled.
+        self.echo("Incoming connection.")
+        # Server commands waiting to be polled and read by the client.
         self.queue = []
 
     def _run(self):
 
-        # Process incoming requests.
+        # Process incoming commands.
         while True:
             line = self.input.readline()
             if not line:
-                self.log("Disconnected.")
+                self.echo("Disconnected.")
                 break
+            if run.debug:
+                self.echo("Got: %r", line)
             try:
-                request = json.loads(line)
-            except ValueError, exception:
-                self.log('%s', exception)
-                request = None
-            result = self.dispatch(request)
+                try:
+                    command = json.loads(line)
+                except ValueError, exception:
+                    raise Error(str(exception))
+                result = self.dispatch(command)
+            except Error, exception:
+                result = ['warn', str(exception)]
             text = json.dumps(result)
             assert '\n' not in text, repr(text)
+            if run.debug:
+                self.echo("Reply: %r", text)
             self.output.write(text + '\n')
 
         # Leave all resources.
@@ -116,105 +135,131 @@ class Client(gevent.Greenlet):
             if self in resource.clients:
                 resource.clients.remove(self)
 
-    def dispatch(self, request):
-        if request:
-            if isinstance(request, list):
-                action = request[0]
-                arguments = request[1:]
-            else:
-                action = request
-                arguments = ()
+    def dispatch(self, command):
+        if command and isinstance(command, list):
+            action = command[0]
+            arguments = command[1:]
         else:
-            action = None
+            action = command
+            arguments = ()
         processor = getattr(self, 'do_%s' % action, None)
         if processor is None:
-            self.log("Unrecognized action in %s", request)
-            return False
-        return processor(*arguments)
+            raise Error("Unrecognized command: %r" % command)
+        try:
+            return processor(*arguments)
+        except TypeError, exception:
+            raise Error(str(exception))
 
-    def do_assert(self, resource, start, string):
+    def do_alter(self, resource, start, end, string):
         resource = Resource.get(resource)
         if resource is None:
-            return "Resource not found."
-        found = resource.contents[start:start + len(string)]
-        if found != string:
-            self.log("Expected %r in %s, found %r.", string, resource, found)
-
-    def do_change(self, resource, start, end, string):
-        resource = Resource.get(resource)
-        if resource is None:
-            return "Resource not found."
+            self.error("Resource not found.")
         if self not in resource.clients:
-            return "Resource is not monitored."
+            self.error("Resource is not monitored.", resource)
         for client in resource.clients:
             client.queue.append((resource.ordinal, start, end, string))
         resource.contents = (resource.contents[:start] + string
                              + resource.contents[end:])
+        return 'done'
+
+    def do_chat(self, user, string):
+        user = Client.get(user)
+        if user is None:
+            self.error("User not found.")
+        user.queue.append(['chat', self.ordinal, string])
+        return 'done'
+
+    def do_check(self, resource, start, string):
+        resource = Resource.get(resource)
+        if resource is None:
+            self.error("Resource not found.")
+        found = resource.contents[start:start + len(string)]
+        if found != string:
+            self.error("Expected %r in %s, found %r."
+                       % (string, resource, found))
+        return 'done'
 
     def do_create(self, name):
         if not isinstance(name, (str, unicode)):
-            return "Name should be a string."
+            self.error("Name should be a string.")
         if Resource.get(name) is not None:
-            return "Resource name already taken."
-        return Resource(name).ordinal
+            self.error("Resource name already taken.")
+        return ['done', Resource(name).ordinal]
 
     def do_join(self, resource, md5sum):
         resource = Resource.get(resource)
         if resource is None:
-            return "Resource not found."
+            self.error("Resource not found.")
         if self in resource.clients:
-            return "Already monitoring."
+            self.error("Already monitoring.")
         if md5sum == md5_empty:
             self.queue.append((0, 0, resource.contents))
         elif md5sum != resource.md5sum():
-            return "Checksums do not match."
+            self.error("Checksums do not match.")
         resource.clients.append(self)
-        return resource.ordinal
+        return ['done', resource.ordinal]
 
     def do_leave(self, resource):
         resource = Resource.get(resource)
         if resource is None:
-            return "Resource not found."
+            self.error("Resource not found.")
         if self not in resource.clients:
-            return "Was not monitoring."
+            self.error("Was not monitoring.")
         resource.clients.remove(self)
+        return 'done'
 
     def do_login(self, name):
-        if self.user:
-            return "Already logged in."
-        if name in User.registry.values():
-            return "User name already taken."
-        self.user = User.ordinal
-        User.ordinal += 1
-        User.registry[self.user] = name
-        return self.user
+        if not isinstance(name, (str, unicode)):
+            self.error("Name should be a string.")
+        if Client.get(name) is not None:
+            self.error("User name already taken.")
+        self.name = name
+        return ['done', self.ordinal]
 
     def do_logout(self):
-        if self.user:
-            del User.registry[self.user]
-            self.user = 0
-            return 0
-        return "Not logged in."
+        if self.name is Client.name:
+            self.error("Not logged in.")
+        del self.name
+        return ['done', self.ordinal]
 
     def do_resources(self):
-        return [[key, resource.name]
-                for key, resource in sorted(Resource.registry.items())]
+        return ['done'] + [
+            [key, resource.name]
+             for key, resource in sorted(Resource.registry.items())]
 
-    def do_poll(self, *subrequests):
-        for request in subrequests:
-            result = self.dispatch(request)
+    def do_poll(self, *subcommands):
+        for command in subcommands:
+            result = self.dispatch(command)
             if isinstance(result, (str, unicode)):
                 return result
         queue = self.queue
         self.queue = []
-        return queue
+        return ['exec'] + queue
 
     def do_users(self):
-        return [[key, value]
-                for key, value in sorted(User.registry.items())]
+        return ['done'] + [
+            [key, client.name]
+             for key, client in sorted(Client.registry.items())]
 
-    def log(self, format, *arguments):
-        run.log('%s.%d: ' + format, self.host, self.port, *arguments)
+    def error(self, diagnostic, resource=None):
+        if resource is not None:
+            if self in resource.clients:
+                resource.clients.remove(self)
+                diagnostic = "Sync is now lost: " + diagnostic
+            else:
+                diagnostic = "Not in sync: " + diagnostic
+        raise Error(diagnostic)
+
+    @staticmethod
+    def get(name):
+        if isinstance(name, int):
+            return Client.registry.get(name)
+        for key, client in Client.registry.iteritems():
+            if name == client.name:
+                return client
+
+    def echo(self, format, *arguments):
+        run.echo('%s.%d: ' + format, self.host, self.port, *arguments)
 
 
 class Resource:
@@ -229,6 +274,9 @@ class Resource:
         self.contents = ''
         self.clients = []
 
+    def __repr__(self):
+        return repr(self.name)
+
     @staticmethod
     def get(name):
         if isinstance(name, int):
@@ -239,11 +287,6 @@ class Resource:
 
     def md5sum(self):
         return hashlib.md5(self.contents).hexdigest()
-
-
-class User:
-    ordinal = 1
-    registry = {0: "Anonymous"}
 
 
 run = Main()

@@ -156,6 +156,58 @@ triggered alter commands from the server and execute them all."
     (colorg-local-enable)))
 
 (colorg-global-enable)
+
+;;; Coloration matters.
+
+(defconst colorg-phi (* 0.5 (1+ (sqrt 5)))
+  "Golden ratio.")
+
+(defvar colorg-hue-bias (progn (random t) (random 360))
+  "Bias for hue, so colors are never predictable.")
+
+(defvar colorg-created-faces nil
+  "Association list from ordinals to faces.")
+
+(defun colorg-colorize (start end ordinal)
+  "Highlight region from START to END with a color tied to ORDINAL.
+The first time an ordinal appears, automatically select a color for it."
+  (let ((pair (assoc ordinal colorg-created-faces))
+        face)
+    (if pair
+        (setq face (cdr pair))
+      (let* ((product (* colorg-phi ordinal))
+             (hue (+ colorg-hue-bias
+                     (* 360.0 (- product (ffloor product)))))
+             (rgb (colorg-hsv-to-rgb hue 0.25 1.0))
+             (name (format "colorg-face-%d" ordinal)))
+        (setq face (make-face (make-symbol name)))
+        (set-face-background face
+                             (format "#%02x%02x%02x"
+                                     (floor (* 255.0 (nth 0 rgb)))
+                                     (floor (* 255.0 (nth 1 rgb)))
+                                     (floor (* 255.0 (nth 2 rgb))))))
+      (push (cons ordinal face) colorg-created-faces))
+    (put-text-property start end 'face face)))
+
+(defun colorg-hsv-to-rgb (hue saturation value)
+  "Convert an HSV color to RGB.
+HUE is taken modulo 360.0, SATURATION and VALUE are within [0.0, 1.0].
+Returns a list (RED GREEN BLUE), each within [0.0, 1.0].
+Adapted from Adrian Aichner code, see http://emacswiki.org/emacs/hsv2rgb.el."
+  (setq hue (mod hue 360.0)
+        saturation (float saturation)
+        value (float value))
+  (let* ((index (floor hue 60.0))
+         (factor (- (/ hue 60.0) index))
+         (x (* value (- 1.0 saturation)))
+         (y (* value (- 1.0 (* factor saturation))))
+         (z (* value (- 1.0 (* (- 1.0 factor) saturation)))))
+    (cond ((= index 0) (list value z x))
+          ((= index 1) (list y value x))
+          ((= index 2) (list x value z))
+          ((= index 3) (list x y value))
+          ((= index 4) (list z x value))
+          ((= index 5) (list value x y)))))
 
 (provide 'colorg)
 ;;; colorg.el ends here

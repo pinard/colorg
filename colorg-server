@@ -18,13 +18,24 @@
 # Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.  */
 
 """\
-ColOrg is a real-time collaborative editing tool meant for Emacs
-Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
+ColOrg server, to orchestrate collobaration between many ColOrg users.
 
-This is the ColOrg server.
+ColOrg is a real-time collaborative editing tool originally meant for
+Emacs Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
+
+Usage: colorg-server [OPTION]... [HOST] [PORT]
+
+Options:
+  -d   Debug all communication.
+  -h   Print this help, and do nothing else.
+
+If HOST is specified, listen for connections on HOST instead of 0.0.0.0.
+If PORT is specified, listen for connections on PORT rather than on 7997.
+PORT being recognized as a decimal number, HOST may be omitted.
 """
 
 __metaclass__ = type
+import datetime
 import gevent
 from gevent import socket
 import hashlib
@@ -38,34 +49,37 @@ class Error(Exception):
     pass
 
 
+class Warn(Exception):
+    pass
+
+
 class Main:
     debug = False
     host = '0.0.0.0'
     port = 7997
 
     def main(self, *arguments):
-        """\
-ColOrg server.  Orchestrate collobaration between many ColOrg clients.
-
-Usage: colorg-server [OPTION]...
-
-Options:
-  -d        Debug all communication.
-  -h HOST   Listen for connections on HOST instead of 0.0.0.0.
-  -p PORT   Listen for connections on PORT rather than on 7997.
-"""
+        "Main entry point."
 
         # Decode options.
         import getopt
-        options, arguments = getopt.getopt(arguments, 'dh:p:')
+        options, arguments = getopt.getopt(arguments, 'dh')
         for option, value in options:
             if option == '-d':
                 self.debug = True
             elif option == '-h':
-                self.host = value
-            elif option == '-p':
-                self.port = int(value)
-        assert not arguments, arguments
+                sys.stdout.write(__doc__)
+                return
+        if len(arguments) == 1 and arguments[0].isdigit():
+            self.port = int(arguments[0])
+        else:
+            if len(arguments) >= 1:
+                self.host = arguments[0]
+            if len(arguments) >= 2:
+                self.port = int(arguments[1])
+            if len(arguments) > 2:
+                sys.exit("More than 2 arguments.  Try %s -h for help."
+                         % sys.argv[0])
 
         # Start it all.
         try:
@@ -74,37 +88,73 @@ Options:
             sys.stderr.write('\n')
 
     def listener(self):
-        "To each new connection, assign a Client."
+        "To each new connection, assign a User."
         handle = socket.socket()
         handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         handle.bind((self.host, self.port))
         handle.listen(1)
-        self.echo("ColOrg server accepting connections on %s, port %d.",
-                  self.host, self.port)
+        self.report("ColOrg server accepting connections on %s, port %d.",
+                    self.host, self.port)
         while True:
             handle2, address = handle.accept()
-            Client(handle2, address).start()
+            User(handle2, *address).start()
 
-    def echo(self, format, *arguments):
+    def report(self, format, *arguments):
         sys.stderr.write('%s\n' % (format % arguments).rstrip())
 
 
-class Client(gevent.Greenlet):
+class Resource:
+    ordinal = 0
+    registry = {}
+
+    def __init__(self, name):
+        self.name = name
+        self.ordinal = Resource.ordinal
+        Resource.ordinal += 1
+        Resource.registry[self.ordinal] = self
+        self.contents = ''
+        self.users = []
+
+    def __repr__(self):
+        return repr(self.name)
+
+    def alter(self, start, end, string):
+        self.contents = self.contents[:start] + string + self.contents[end:]
+
+    @staticmethod
+    def get(name):
+        if isinstance(name, int):
+            return Resource.registry.get(name)
+        for key, resource in Resource.registry.iteritems():
+            if name == resource.name:
+                return resource
+
+    def get_contents(self):
+        return self.contents
+
+    def md5sum(self):
+        return hashlib.md5(self.contents).hexdigest()
+
+
+class User(gevent.Greenlet):
     name = "Anonymous"
     ordinal = 0
     registry = {}
 
-    def __init__(self, handle, address):
-        self.ordinal = Client.ordinal
-        Client.ordinal += 1
-        Client.registry[self.ordinal] = self
-        super(Client, self).__init__()
+    def __init__(self, handle, host, port):
+        self.ordinal = User.ordinal
+        User.ordinal += 1
+        User.registry[self.ordinal] = self
+        super(User, self).__init__()
         self.input = handle.makefile()
         self.output = handle.makefile('w', 0)
-        self.host, self.port = address
-        self.echo("Incoming connection.")
+        self.host = host
+        self.port = port
+        self.report("Incoming connection.")
+        # User commands waiting to be processed on the server.
+        self.incoming_queue = []
         # Server commands waiting to be polled and read by the client.
-        self.queue = []
+        self.outgoing_queue = []
 
     def _run(self):
 
@@ -112,28 +162,30 @@ class Client(gevent.Greenlet):
         while True:
             line = self.input.readline()
             if not line:
-                self.echo("Disconnected.")
+                self.report("Disconnected.")
                 break
             if run.debug:
-                self.echo("Got: %r", line)
+                self.report("Got: %r", line)
             try:
                 try:
                     command = json.loads(line)
                 except ValueError, exception:
-                    raise Error(str(exception))
+                    raise Warn(str(exception))
                 result = self.dispatch(command)
             except Error, exception:
+                result = ['error', str(exception)]
+            except Warn, exception:
                 result = ['warn', str(exception)]
             text = json.dumps(result)
             assert '\n' not in text, repr(text)
             if run.debug:
-                self.echo("Reply: %r", text)
+                self.report("Reply: %r", text)
             self.output.write(text + '\n')
 
         # Leave all resources.
         for resource in Resource.registry.itervalues():
-            if self in resource.clients:
-                resource.clients.remove(self)
+            if self in resource.users:
+                resource.users.remove(self)
 
     def dispatch(self, command):
         if command and isinstance(command, list):
@@ -144,81 +196,69 @@ class Client(gevent.Greenlet):
             arguments = ()
         processor = getattr(self, 'do_%s' % action, None)
         if processor is None:
-            raise Error("Unrecognized command: %r" % command)
+            raise Warn("Unrecognized command: %r" % command)
         try:
             return processor(*arguments)
         except TypeError, exception:
-            raise Error(str(exception))
+            raise Warn(str(exception))
 
     def do_alter(self, resource, start, end, string):
-        resource = Resource.get(resource)
-        if resource is None:
-            self.error("Resource not found.")
-        if self not in resource.clients:
-            self.error("Resource is not monitored.", resource)
-        for client in resource.clients:
-            client.queue.append((resource.ordinal, start, end, string))
-        resource.contents = (resource.contents[:start] + string
-                             + resource.contents[end:])
+        resource = self.resolve_resource(resource)
+        if self not in resource.users:
+            raise Error("Resource not monitored: %r" % resource)
+        resource.alter(start, end, string)
+        for client in resource.users:
+            if client is not self:
+                client.outgoing_queue.append(
+                    ('alter', resource.ordinal, start, end, string,
+                     self.ordinal))
         return 'done'
 
     def do_chat(self, user, string):
-        user = Client.get(user)
-        if user is None:
-            self.error("User not found.")
-        user.queue.append(['chat', self.ordinal, string])
-        return 'done'
-
-    def do_check(self, resource, start, string):
-        resource = Resource.get(resource)
-        if resource is None:
-            self.error("Resource not found.")
-        found = resource.contents[start:start + len(string)]
-        if found != string:
-            self.error("Expected %r in %s, found %r."
-                       % (string, resource, found))
+        user = self.resolve_user(user)
+        user.outgoing_queue.append(['chat', self.ordinal, string])
         return 'done'
 
     def do_create(self, name):
         if not isinstance(name, (str, unicode)):
-            self.error("Name should be a string.")
+            raise Warn("Name should be a string: %r" % name)
         if Resource.get(name) is not None:
-            self.error("Resource name already taken.")
-        return ['done', Resource(name).ordinal]
+            raise Warn("Resource name already taken: %r" % name)
+        resource = Resource(name)
+        resource.users.append(self)
+        return ['done', resource.ordinal]
 
     def do_join(self, resource, md5sum):
-        resource = Resource.get(resource)
-        if resource is None:
-            self.error("Resource not found.")
-        if self in resource.clients:
-            self.error("Already monitoring.")
+        resource = self.resolve_resource(resource)
+        if self in resource.users:
+            raise Warn("Already monitoring: %r" % resource)
         if md5sum == md5_empty:
-            self.queue.append((0, 0, resource.contents))
+            self.outgoing_queue.append(
+                ('alter', resource.ordinal, 0, 0, resource.get_contents(), 0))
         elif md5sum != resource.md5sum():
-            self.error("Checksums do not match.")
-        resource.clients.append(self)
+            raise Warn("Checksums do not match: %r %s here, %s remotely."
+                       % resource, resource.md5sum(), md5sum)
+        resource.users.append(self)
         return ['done', resource.ordinal]
 
     def do_leave(self, resource):
-        resource = Resource.get(resource)
-        if resource is None:
-            self.error("Resource not found.")
-        if self not in resource.clients:
-            self.error("Was not monitoring.")
-        resource.clients.remove(self)
+        resource = self.resolve_resource(resource)
+        if self not in resource.users:
+            raise Warn("Was not monitoring: %r" % resource)
+        resource.users.remove(self)
         return 'done'
 
     def do_login(self, name):
         if not isinstance(name, (str, unicode)):
-            self.error("Name should be a string.")
-        if Client.get(name) is not None:
-            self.error("User name already taken.")
+            raise Warn("Name should be a string: %r" % name)
+        if User.get(name) is not None:
+            raise Warn("User name already taken: %r" % name)
         self.name = name
         return ['done', self.ordinal]
 
     def do_logout(self):
-        if self.name is Client.name:
-            self.error("Not logged in.")
+        if self.name is User.name:
+            raise Warn("Not logged in: %r" % self)
         del self.name
         return ['done', self.ordinal]
 
@@ -232,61 +272,40 @@ class Client(gevent.Greenlet):
             result = self.dispatch(command)
             if isinstance(result, (str, unicode)):
                 return result
-        queue = self.queue
-        self.queue = []
+        queue = self.outgoing_queue
+        self.outgoing_queue = []
         return ['exec'] + queue
 
     def do_users(self):
         return ['done'] + [
             [key, client.name]
-             for key, client in sorted(Client.registry.items())]
-
-    def error(self, diagnostic, resource=None):
-        if resource is not None:
-            if self in resource.clients:
-                resource.clients.remove(self)
-                diagnostic = "Sync is now lost: " + diagnostic
-            else:
-                diagnostic = "Not in sync: " + diagnostic
-        raise Error(diagnostic)
+             for key, client in sorted(User.registry.items())]
 
     @staticmethod
     def get(name):
         if isinstance(name, int):
-            return Client.registry.get(name)
-        for key, client in Client.registry.iteritems():
+            return User.registry.get(name)
+        for key, client in User.registry.iteritems():
             if name == client.name:
                 return client
 
-    def echo(self, format, *arguments):
-        run.echo('%s.%d: ' + format, self.host, self.port, *arguments)
+    def report(self, format, *arguments):
+        now = datetime.datetime.now().time()
+        run.report('%.2d:%.2d:%.2d [%s.%d]: ' + format,
+                   now.hour, now.minute, now.second,
+                   self.host, self.port, *arguments)
 
+    def resolve_resource(self, resource):
+        found = Resource.get(resource)
+        if found is None:
+            raise Warn("Resource not found: %r" % resource)
+        return found
 
-class Resource:
-    ordinal = 0
-    registry = {}
-
-    def __init__(self, name):
-        self.name = name
-        self.ordinal = Resource.ordinal
-        Resource.ordinal += 1
-        Resource.registry[self.ordinal] = self
-        self.contents = ''
-        self.clients = []
-
-    def __repr__(self):
-        return repr(self.name)
-
-    @staticmethod
-    def get(name):
-        if isinstance(name, int):
-            return Resource.registry.get(name)
-        for key, resource in Resource.registry.iteritems():
-            if name == resource.name:
-                return resource
-
-    def md5sum(self):
-        return hashlib.md5(self.contents).hexdigest()
+    def resolve_user(self, user):
+        found = User.get(user)
+        if found is None:
+            raise Warn("User not found: %r" % user)
+        return found
 
 
 run = Main()

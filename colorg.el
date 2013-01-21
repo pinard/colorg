@@ -38,7 +38,7 @@
 ;; The code is organized into pages, grouping declarations by topic.
 ;; Such pages are introduced by a form feed and a topic description.
 
-;;; Essential hooks
+;;; Main declarations
 
 (defvar colorg-current-resource nil
   "Description of the synchronized resource for the current buffer.
@@ -57,7 +57,19 @@ kept on one of more servers.")
 
 (defvar colorg-outgoing-list nil
   "Accumulated alter commands meant to be broadcasted.
+This is a reversed list, the most recent command appears first.
 These are sent to the server whenever Emacs gets idle for a jiffie.")
+
+(defvar colorg-accept-timeout 5
+  "Number of seconds to wait after the ColOrg server.")
+
+(defvar colorg-idle-timeout 2
+  "Number of quiescent second before polling the ColOrg server.")
+
+(defvar colorg-notification-timeout 3
+  "Number of seconds to keep a notification displayed.")
+
+;;; Main hooks
 
 (defun colorg-after-change-routine (start end deleted)
   "After any buffer change, tell the server about the alter to do.
@@ -66,37 +78,157 @@ These commands are accumulated and sent at regular intervals."
     ;; Combine a pure insert with a previous alter, whenever possible.
     (let ((info (and colorg-outgoing-list
                      (zerop deleted)
-                     (string-equal (caar colorg-outgoing-list) "alter")
+                     (eq (caar colorg-outgoing-list) 'alter)
                      (= (cadar colorg-outgoing-list) colorg-current-resource)
                      (cddar colorg-outgoing-list))))
-      (if (and info (= start (+ (car info) (length (caddr info)))))
+      (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
           (setcar (cddr info)
-                  (concat (caddr info) (buffer-substring start end)))
-        (push (list "alter" colorg-current-resource start (+ start deleted)
-                    (buffer-substring start end))
+                  (concat (caddr info)
+                             (buffer-substring-no-properties start end)))
+        (push (list 'alter colorg-current-resource
+                    (1- start) (+ (1- start) deleted)
+                    (buffer-substring-no-properties start end))
               colorg-outgoing-list)))))
-
-(defun colorg-before-change-routine (start end)
-  "Before any buffer change, instruct the server to assert previous contents.
-These commands are accumulated and sent at regular intervals.
-This is merely a debugging feature, which may be inhibited to get some speed."
-  (when colorg-current-resource
-    (unless (= start end)
-      (push (list "check" start end (buffer-substring start end))
-            colorg-outgoing-list))))
 
 (defun colorg-idle-routine ()
   "Whenever Emacs gets idle, round-trip with the synchronization server.
 We push out accumulated commands.  Then, we get externally
 triggered alter commands from the server and execute them all."
-  (let* ((outgoing (if colorg-outgoing-list
-                       (cons 'poll (nreverse colorg-outgoing-list))
-                     'poll))
-         (results (colorg-round-trip outgoing)))
-    (message "%S" results)))
+  (let ((outgoing colorg-outgoing-list))
+    (setq colorg-outgoing-list nil)
+    (let ((values
+           (save-match-data
+             (colorg-ask-server (if outgoing
+                                    (cons 'poll (nreverse outgoing))
+                                  'poll)))))
+      ;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
+      values)))
+
+;;; Local actions.
+
+(defun colorg-ask-server (command)
+  "Send COMMAND to server, receive and process reply, then return values."
+  (colorg-process (colorg-round-trip command)))
+
+(defun colorg-process (command)
+  (let (action arguments values)
+    (if (stringp command)
+        (setq action (intern command)
+              arguments nil)
+      (setq action (intern (car command))
+            arguments (cdr command)))
+    (cond ((eq action 'alter)
+           (let ((inhibit-point-motion-hooks t)
+                 (resource (nth 0 arguments))
+                 (start (1+ (nth 1 arguments)))
+                 (end (1+ (nth 2 arguments)))
+                 (string (nth 3 arguments))
+                 (user (nth 4 arguments)))
+             (save-excursion
+               ;; FIXME: Switch to the proper resource.
+               (delete-region start end)
+               (goto-char start)
+               (when (numberp string)
+                 (setq string (make-string string '?')))
+               (insert string)
+               (colorg-colorize start (+ start (length string)) user))))
+          ((eq action 'chat)
+           (let ((user (nth 0 arguments))
+                 (string (nth 1 arguments)))
+             (colorg-notify
+              (concat
+               (propertize (format "User %s:" user)
+                           'face (colorg-face-name user) 'weight "bold")
+               " " string))))
+          ((eq action 'done)
+           (setq values arguments))
+          ((eq action 'exec)
+           (setq values (append (mapcar 'colorg-process arguments))))
+          ((eq action 'error)
+           (let ((string (nth 0 arguments)))
+             (colorg-local-disable)
+             (colorg-notify
+              (concat
+               (propertize "Error (disabling): " 'face 'font-lock-warning-face)
+               string))))
+          ((eq action 'warn)
+           (let ((string (nth 0 arguments)))
+             (colorg-notify
+              (concat
+               (propertize "Warning: " 'face 'font-lock-warning-face)
+               string))))
+          (t (debug)))
+    values))
+
+(defvar colorg-notification-buffer-name "*colorg-notification*"
+  "Name of ColOrg notification buffer.")
+
+(defun colorg-notify (text)
+  (message "colorg-notify: %s" text)
+  (colorg-show-notification text)
+  ;; FIXME: (beep) to be made programmable.
+  (run-at-time colorg-notification-timeout nil
+               'colorg-hide-notification))
+
+(defun colorg-show-notification (text)
+  "Display TEXT as a notification, in a separate buffer."
+  ;; Adapted from appt.el.
+  (let ((this-window (selected-window))
+        (buffer (get-buffer-create colorg-notification-buffer-name)))
+    ;; Make sure we're not in the minibuffer before splitting the window.
+    (when (minibufferp)
+      (other-window 1)
+      (and (minibufferp) (display-multi-frame-p) (other-frame 1)))
+    (if (cdr (assq 'unsplittable (frame-parameters)))
+        ;; In an unsplittable frame, use something somewhere else.
+	(progn
+	  (set-buffer buffer)
+	  (display-buffer buffer))
+      (unless (or (special-display-p (buffer-name buffer))
+                  (same-window-p (buffer-name buffer)))
+        ;; By default, split the bottom window and use the lower part.
+        (appt-select-lowest-window)
+        ;; Split the window, unless it's too small to do so.
+        (when (>= (window-height) (* 2 window-min-height))
+          (select-window (split-window))))
+      (switch-to-buffer buffer))
+    (setq buffer-read-only nil
+          buffer-undo-list t)
+    (erase-buffer)
+    (insert text)
+    (shrink-window-if-larger-than-buffer (get-buffer-window buffer t))
+    (set-buffer-modified-p nil)
+    (setq buffer-read-only t)
+    (raise-frame (selected-frame))
+    (select-window this-window)))
+
+(defun colorg-hide-notification ()
+  "Function called to undisplay the notification message."
+  ;; Adapted from appt.el.
+  (let ((window (get-buffer-window colorg-notification-buffer-name t)))
+    (and window
+         (or (eq window (frame-root-window (window-frame window)))
+             (delete-window window))))
+  (kill-buffer colorg-notification-buffer-name))
+
+(defun colorg-select-lowest-window ()
+  "Select the lowest window on the frame."
+  ;; Stolen from appt.el.
+  (let ((lowest-window (selected-window))
+        (bottom-edge (nth 3 (window-edges)))
+        next-bottom-edge)
+    (walk-windows (lambda (window)
+                    (when (< bottom-edge
+                             (setq next-bottom-edge
+                                   (nth 3 (window-edges window))))
+                      (setq bottom-edge next-bottom-edge
+                            lowest-window window)))
+                  'except-minibuffer)
+    (select-window lowest-window)))
 
 ;;; Communication protocol.
 
+;; FIXME: Should have one such buffer per server.
 (defvar colorg-buffer-name "*ColOrg*")
 (defvar colorg-process nil)
 (defvar colorg-buffer nil)
@@ -104,7 +236,9 @@ triggered alter commands from the server and execute them all."
 (require 'json)
 
 (defun colorg-round-trip (data)
-  (unless (processp colorg-process)
+  (unless (and (processp colorg-process)
+               ;; FIXME: Because I restart the server?  Not healthy!
+               (eq (process-status colorg-process) 'open))
     (setq colorg-buffer (get-buffer-create colorg-buffer-name))
     (setq colorg-process
           (open-network-stream "essai" colorg-buffer "localhost" 7997)))
@@ -113,7 +247,12 @@ triggered alter commands from the server and execute them all."
     (erase-buffer)
     (process-send-string nil (concat (json-encode data) "\n"))
     (while (not (search-forward "\n" nil t))
-      (accept-process-output colorg-process)
+      (goto-char (point-max))
+      (let ((here (point)))
+        (accept-process-output colorg-process colorg-accept-timeout)
+        (when (= here (point-max))
+          (colorg-local-disable)
+          (error "ColOrg disabled: server does not seem to reply.")))
       (goto-char (point-min)))
     (goto-char (point-min))
     (let ((json-array-type 'list)) (json-read))))
@@ -123,26 +262,35 @@ triggered alter commands from the server and execute them all."
 (defun colorg-global-enable ()
   (interactive)
   (add-hook 'after-change-functions 'colorg-after-change-routine)
-  (add-hook 'before-change-functions 'colorg-before-change-routine)
-  (setq colorg-idle-timer (run-with-idle-timer 2 t 'colorg-idle-routine)))
+  (setq colorg-idle-timer
+        ;; FIXME: run-with-idle-timer is the real goal, but I do not
+        ;; succeed in firing it frequently enough.
+        (run-with-timer 0.1 colorg-idle-timeout 'colorg-idle-routine)))
 
 (defun colorg-global-disable ()
   (interactive)
   (remove-hook 'after-change-functions 'colorg-after-change-routine)
-  (remove-hook 'before-change-functions 'colorg-before-change-routine)
   (cancel-timer colorg-idle-timer))
 
 (defun colorg-local-enable ()
   (interactive)
-  (let ((reply (colorg-round-trip
-                (list "create" (read-string "Resource name? ")))))
-    (unless (string-equal (car reply) "done")
-      (error "%S" reply))
-    (setq colorg-current-resource (cadr reply)))
-  (push (list "alter" colorg-current-resource (point-min) (point-min)
-              (buffer-substring (point-min) (point-max)))
-        colorg-outgoing-list)
-  (message "ColOrg enabled."))
+  (let ((
+  (let ((name (read-string "Resource name? ")))
+    (when (string-equal name "")
+      (setq name (buffer-name)))
+    (if (= (point-min) (point-max))
+        (let ((values (colorg-ask-server (list 'join name md5sum))))
+          (unless values
+            (error "Resource could not be joined."))
+          (setq colorg-current-resource (car values)))
+      (let ((values (colorg-ask-server (list 'create name))))
+        (unless values
+          (error "Resource could not be created."))
+      ((set  )q colorg-current-resource (car values))))
+    (push (list 'alter colorg-current-resource (point-min) (point-min)
+                (buffer-substring-no-properties (point-min) (point-max)))
+          colorg-outgoing-list)
+    (message "ColOrg enabled.")))
 
 (defun colorg-local-disable ()
   (interactive)
@@ -159,13 +307,6 @@ triggered alter commands from the server and execute them all."
 
 ;;; Coloration matters.
 
-(defvar colorg-test-ordinal 0)
-
-(defun colorg-test (start end)
-  (interactive "r")
-  (colorg-colorize start end colorg-test-ordinal)
-  (setq colorg-test-ordinal (1+ colorg-test-ordinal)))
-
 (defconst colorg-phi (* 0.5 (1+ (sqrt 5)))
   "Golden ratio.")
 
@@ -173,26 +314,32 @@ triggered alter commands from the server and execute them all."
   "Bias for hue, so colors are never predictable.")
 
 (defvar colorg-overlays nil
-  "Association between ordinals and overlays.")
+  "Association between keys and overlays.")
 
-(defun colorg-colorize (start end ordinal)
-  "Highlight region from START to END with a color tied to ORDINAL.
-The first time an ordinal appears, automatically select a color for it.
-Else, first remove the previous highlight made for that ordinal."
-  (let ((pair (assoc ordinal colorg-overlays)))
+(defun colorg-colorize (start end key)
+  "Highlight region from START to END with a color tied to KEY.
+The first time an key appears, automatically select a color for it.
+Else, first remove the previous highlight made for that key."
+  (let ((pair (assoc key colorg-overlays)))
     (if pair
         (move-overlay (cdr pair) start end)
-      (let ((overlay (make-overlay start end))
-            (rgb (colorg-hsv-to-rgb
-                  (+ colorg-hue-bias (* colorg-phi ordinal)) 0.25 1.0))
-            (symbol (intern (format "colorg-face-%d" ordinal))))
+      (let ((overlay (make-overlay start end)))
+        (overlay-put overlay 'face (colorg-face-name key))
+        (push (cons key overlay) colorg-overlays)))))
+
+(defun colorg-face-name (key)
+  "Return the face name, as a symbol, associated with user KEY.
+Create a new face if it does not exist already."
+  (let ((symbol (intern (format "colorg-face-%d" key))))
+    (unless (facep symbol)
+      (let ((rgb (colorg-hsv-to-rgb
+                  (+ colorg-hue-bias (* colorg-phi key)) 0.25 1.0)))
         (set-face-background (make-face symbol)
                              (format "#%02x%02x%02x"
                                      (floor (* 255.0 (nth 0 rgb)))
                                      (floor (* 255.0 (nth 1 rgb)))
-                                     (floor (* 255.0 (nth 2 rgb)))))
-        (overlay-put overlay 'face symbol)
-        (push (cons ordinal overlay) colorg-overlays)))))
+                                     (floor (* 255.0 (nth 2 rgb)))))))
+    symbol))
 
 (defun colorg-hsv-to-rgb (hue saturation value)
   "Convert an HSV color to RGB.

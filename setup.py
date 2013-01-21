@@ -23,5 +23,6 @@ setup(name='ColOrg',
       author_email='pinard@iro.umontreal.ca',
       url='https://github.com/pinard/ColOrg',
       install_requires=['gevent'],
+      scripts=['colorg-server'],
       license='GPLv3'
 )

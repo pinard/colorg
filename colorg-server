@@ -150,7 +150,8 @@ class User(gevent.Greenlet):
         self.output = handle.makefile('w', 0)
         self.host = host
         self.port = port
-        self.report("Incoming connection.")
+        self.report_id = '%s:%d' % (host, port)
+        self.report("%s Incoming connection.", self.report_id)
         # User commands waiting to be processed on the server.
         self.incoming_queue = []
         # Server commands waiting to be polled and read by the client.
@@ -162,10 +163,10 @@ class User(gevent.Greenlet):
         while True:
             line = self.input.readline()
             if not line:
-                self.report("Disconnected.")
+                self.report("%s Disconnected.", self.report_id)
                 break
             if run.debug:
-                self.report("Got: %r", line)
+                self.report("%s %s", self.report_id, line.rstrip())
             try:
                 try:
                     command = json.loads(line)
@@ -179,7 +180,7 @@ class User(gevent.Greenlet):
             text = json.dumps(result)
             assert '\n' not in text, repr(text)
             if run.debug:
-                self.report("Reply: %r", text)
+                self.report("%s %s", ' ' * len(self.report_id), text)
             self.output.write(text + '\n')
 
         # Leave all resources.
@@ -254,6 +255,7 @@ class User(gevent.Greenlet):
         if User.get(name) is not None:
             raise Warn("User name already taken: %r" % name)
         self.name = name
+        self.report_id = name
         return ['done', self.ordinal]
 
     def do_logout(self):
@@ -274,7 +276,9 @@ class User(gevent.Greenlet):
                 return result
         queue = self.outgoing_queue
         self.outgoing_queue = []
-        return ['exec'] + queue
+        if queue:
+            return ['exec'] + queue
+        return 'exec'
 
     def do_users(self):
         return ['done'] + [
@@ -291,9 +295,8 @@ class User(gevent.Greenlet):
 
     def report(self, format, *arguments):
         now = datetime.datetime.now().time()
-        run.report('%.2d:%.2d:%.2d [%s.%d]: ' + format,
-                   now.hour, now.minute, now.second,
-                   self.host, self.port, *arguments)
+        run.report('%.2d:%.2d:%.2d ' + format,
+                   now.hour, now.minute, now.second, *arguments)
 
     def resolve_resource(self, resource):
         found = Resource.get(resource)

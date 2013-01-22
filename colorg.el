@@ -27,18 +27,37 @@
 ;; ColOrg is a real-time collaborative editing tool meant for Emacs
 ;; Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
 
-;; At this stage, the tool is aiming simplicity: the
-;; idea is to quickly get a working prototype.  All collaborating
-;; users are connected to a common server, communications do not try
-;; to be fully asynchronous, so users might experience delays.
-;; Further experimentation, tuning and development may follow.
+;; At this stage, the tool is aiming simplicity: the idea is to
+;; quickly get a working prototype.  All collaborating users are
+;; connected to a common server, communications do not try to be fully
+;; asynchronous, so users might experience delays.  Further
+;; experimentation, tuning and development may follow.
 
 ;;; Code:
 
 ;; The code is organized into pages, grouping declarations by topic.
 ;; Such pages are introduced by a form feed and a topic description.
 
-;;; Main declarations
+;;; User parameterization.
+
+(defvar colorg-user-nickname (user-login-name)
+  "Name by which this user is identified to other collaborators.")
+
+(defvar colorg-accept-timeout 5
+  "Number of seconds to wait after the ColOrg server.")
+
+(defvar colorg-idle-timeout 2
+  "Number of quiescent second before polling the ColOrg server.")
+
+(defvar colorg-notification-timeout 4
+  "Number of seconds to keep each notification displayed.
+Instead of a number, the value 'ask waits for the user to type Enter.
+The special value 'org rather requests Org notifications.")
+
+(defvar colorg-notification-beep t
+  "Use nil to inhibit notification sounds.")
+
+;;; Activation and deactivation.
 
 (defvar colorg-current-resource nil
   "Description of the synchronized resource for the current buffer.
@@ -52,65 +71,70 @@ kept on one of more servers.")
 
 (make-variable-buffer-local 'colorg-current-resource)
 
-(defvar colorg-idle-timer nil
-  "Timer used to detect the quiescence of Emacs.")
+(defvar colorg-nickname-already-transmitted nil
+  "Temporary kludge.")
 
-(defvar colorg-outgoing-list nil
-  "Accumulated alter commands meant to be broadcasted.
-This is a reversed list, the most recent command appears first.
-These are sent to the server whenever Emacs gets idle for a jiffie.")
+(defun colorg-global-enable ()
+  (interactive)
+  (add-hook 'after-change-functions 'colorg-after-change-routine)
+  (setq colorg-idle-timer
+        ;; FIXME: run-with-idle-timer is the real goal, but I do not
+        ;; succeed in firing it frequently enough.
+        (run-with-timer 0.1 colorg-idle-timeout 'colorg-idle-routine)))
 
-(defvar colorg-accept-timeout 5
-  "Number of seconds to wait after the ColOrg server.")
+(defun colorg-global-disable ()
+  (interactive)
+  (remove-hook 'after-change-functions 'colorg-after-change-routine)
+  (cancel-timer colorg-idle-timer))
 
-(defvar colorg-idle-timeout 2
-  "Number of quiescent second before polling the ColOrg server.")
+(defun colorg-local-enable ()
+  (interactive)
+  (unless colorg-nickname-already-transmitted
+    (colorg-ask-server(list 'login colorg-user-nickname))
+    (setq colorg-nickname-already-transmitted t))
+  (let ((name (read-string "Resource name? ")))
+    (when (string-equal name "")
+      (setq name (buffer-name)))
+    (if (= (point-min) (point-max))
+        (let ((values (colorg-ask-server (list 'join name md5sum))))
+          (unless values
+            (error "Resource could not be joined."))
+          (setq colorg-current-resource (car values)))
+      (let ((values (colorg-ask-server (list 'create name))))
+        (unless values
+          (error "Resource could not be created."))
+      (setq colorg-current-resource (car values))))
+    (push (list 'alter colorg-current-resource (point-min) (point-min)
+                (buffer-substring-no-properties (point-min) (point-max)))
+          colorg-outgoing-list)
+    (message "ColOrg enabled.")))
 
-(defvar colorg-notification-timeout 3
-  "Number of seconds to keep a notification displayed.")
+(defun colorg-local-disable ()
+  (interactive)
+  (setq colorg-current-resource nil)
+  (message "ColOrg disabled."))
+
+(defun colorg-toggle ()
+  (interactive)
+  (if colorg-current-resource
+      (colorg-local-disable)
+    (colorg-local-enable)))
+
+(colorg-global-enable)
 
-;;; Main hooks
+;;; Command processing.
 
-(defun colorg-after-change-routine (start end deleted)
-  "After any buffer change, tell the server about the alter to do.
-These commands are accumulated and sent at regular intervals."
-  (when colorg-current-resource
-    ;; Combine a pure insert with a previous alter, whenever possible.
-    (let ((info (and colorg-outgoing-list
-                     (zerop deleted)
-                     (eq (caar colorg-outgoing-list) 'alter)
-                     (= (cadar colorg-outgoing-list) colorg-current-resource)
-                     (cddar colorg-outgoing-list))))
-      (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
-          (setcar (cddr info)
-                  (concat (caddr info)
-                             (buffer-substring-no-properties start end)))
-        (push (list 'alter colorg-current-resource
-                    (1- start) (+ (1- start) deleted)
-                    (buffer-substring-no-properties start end))
-              colorg-outgoing-list)))))
-
-(defun colorg-idle-routine ()
-  "Whenever Emacs gets idle, round-trip with the synchronization server.
-We push out accumulated commands.  Then, we get externally
-triggered alter commands from the server and execute them all."
-  (let ((outgoing colorg-outgoing-list))
-    (setq colorg-outgoing-list nil)
-    (let ((values
-           (save-match-data
-             (colorg-ask-server (if outgoing
-                                    (cons 'poll (nreverse outgoing))
-                                  'poll)))))
-      ;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
-      values)))
-
-;;; Local actions.
+(defun colorg-send-message (text)
+  (interactive)
+  ;; FIXME: implement!
+  )
 
 (defun colorg-ask-server (command)
   "Send COMMAND to server, receive and process reply, then return values."
   (colorg-process (colorg-round-trip command)))
 
 (defun colorg-process (command)
+  "Process COMMAND as received from the ColOrg server, then return values."
   (let (action arguments values)
     (if (stringp command)
         (setq action (intern command)
@@ -159,74 +183,51 @@ triggered alter commands from the server and execute them all."
                string))))
           (t (debug)))
     values))
+
+;;; Hooks monitoring user actions.
 
-(defvar colorg-notification-buffer-name "*colorg-notification*"
-  "Name of ColOrg notification buffer.")
+(defun colorg-after-change-routine (start end deleted)
+  "After any buffer change, tell the server about the alter to do.
+These commands are accumulated and sent at regular intervals."
+  (when colorg-current-resource
+    ;; Combine a pure insert with a previous alter, whenever possible.
+    (let ((info (and colorg-outgoing-list
+                     (zerop deleted)
+                     (eq (caar colorg-outgoing-list) 'alter)
+                     (= (cadar colorg-outgoing-list) colorg-current-resource)
+                     (cddar colorg-outgoing-list))))
+      (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
+          (setcar (cddr info)
+                  (concat (caddr info)
+                             (buffer-substring-no-properties start end)))
+        (push (list 'alter colorg-current-resource
+                    (1- start) (+ (1- start) deleted)
+                    (buffer-substring-no-properties start end))
+              colorg-outgoing-list)))))
 
-(defun colorg-notify (text)
-  (message "colorg-notify: %s" text)
-  (colorg-show-notification text)
-  ;; FIXME: (beep) to be made programmable.
-  (run-at-time colorg-notification-timeout nil
-               'colorg-hide-notification))
-
-(defun colorg-show-notification (text)
-  "Display TEXT as a notification, in a separate buffer."
-  ;; Adapted from appt.el.
-  (let ((this-window (selected-window))
-        (buffer (get-buffer-create colorg-notification-buffer-name)))
-    ;; Make sure we're not in the minibuffer before splitting the window.
-    (when (minibufferp)
-      (other-window 1)
-      (and (minibufferp) (display-multi-frame-p) (other-frame 1)))
-    (if (cdr (assq 'unsplittable (frame-parameters)))
-        ;; In an unsplittable frame, use something somewhere else.
-	(progn
-	  (set-buffer buffer)
-	  (display-buffer buffer))
-      (unless (or (special-display-p (buffer-name buffer))
-                  (same-window-p (buffer-name buffer)))
-        ;; By default, split the bottom window and use the lower part.
-        (appt-select-lowest-window)
-        ;; Split the window, unless it's too small to do so.
-        (when (>= (window-height) (* 2 window-min-height))
-          (select-window (split-window))))
-      (switch-to-buffer buffer))
-    (setq buffer-read-only nil
-          buffer-undo-list t)
-    (erase-buffer)
-    (insert text)
-    (shrink-window-if-larger-than-buffer (get-buffer-window buffer t))
-    (set-buffer-modified-p nil)
-    (setq buffer-read-only t)
-    (raise-frame (selected-frame))
-    (select-window this-window)))
-
-(defun colorg-hide-notification ()
-  "Function called to undisplay the notification message."
-  ;; Adapted from appt.el.
-  (let ((window (get-buffer-window colorg-notification-buffer-name t)))
-    (and window
-         (or (eq window (frame-root-window (window-frame window)))
-             (delete-window window))))
-  (kill-buffer colorg-notification-buffer-name))
-
-(defun colorg-select-lowest-window ()
-  "Select the lowest window on the frame."
-  ;; Stolen from appt.el.
-  (let ((lowest-window (selected-window))
-        (bottom-edge (nth 3 (window-edges)))
-        next-bottom-edge)
-    (walk-windows (lambda (window)
-                    (when (< bottom-edge
-                             (setq next-bottom-edge
-                                   (nth 3 (window-edges window))))
-                      (setq bottom-edge next-bottom-edge
-                            lowest-window window)))
-                  'except-minibuffer)
-    (select-window lowest-window)))
+(defun colorg-idle-routine ()
+  "Whenever Emacs gets idle, round-trip with the synchronization server.
+We push out accumulated commands.  Then, we get externally
+triggered alter commands from the server and execute them all."
+  (let ((outgoing colorg-outgoing-list))
+    (setq colorg-outgoing-list nil)
+    (let ((values
+           (save-match-data
+             (colorg-ask-server (if outgoing
+                                    (cons 'poll (nreverse outgoing))
+                                  'poll)))))
+      ;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
+      values)))
 
 ;;; Communication protocol.
+
+(defvar colorg-idle-timer nil
+  "Timer used to detect the quiescence of Emacs.")
+
+(defvar colorg-outgoing-list nil
+  "Accumulated alter commands meant to be broadcasted.
+This is a reversed list, the most recent command appears first.
+These are sent to the server whenever Emacs gets idle for a jiffie.")
 
 ;; FIXME: Should have one such buffer per server.
 (defvar colorg-buffer-name "*ColOrg*")
@@ -256,54 +257,6 @@ triggered alter commands from the server and execute them all."
       (goto-char (point-min)))
     (goto-char (point-min))
     (let ((json-array-type 'list)) (json-read))))
-
-;;; Activation and deactivation.
-
-(defun colorg-global-enable ()
-  (interactive)
-  (add-hook 'after-change-functions 'colorg-after-change-routine)
-  (setq colorg-idle-timer
-        ;; FIXME: run-with-idle-timer is the real goal, but I do not
-        ;; succeed in firing it frequently enough.
-        (run-with-timer 0.1 colorg-idle-timeout 'colorg-idle-routine)))
-
-(defun colorg-global-disable ()
-  (interactive)
-  (remove-hook 'after-change-functions 'colorg-after-change-routine)
-  (cancel-timer colorg-idle-timer))
-
-(defun colorg-local-enable ()
-  (interactive)
-  (let ((
-  (let ((name (read-string "Resource name? ")))
-    (when (string-equal name "")
-      (setq name (buffer-name)))
-    (if (= (point-min) (point-max))
-        (let ((values (colorg-ask-server (list 'join name md5sum))))
-          (unless values
-            (error "Resource could not be joined."))
-          (setq colorg-current-resource (car values)))
-      (let ((values (colorg-ask-server (list 'create name))))
-        (unless values
-          (error "Resource could not be created."))
-      ((set  )q colorg-current-resource (car values))))
-    (push (list 'alter colorg-current-resource (point-min) (point-min)
-                (buffer-substring-no-properties (point-min) (point-max)))
-          colorg-outgoing-list)
-    (message "ColOrg enabled.")))
-
-(defun colorg-local-disable ()
-  (interactive)
-  (setq colorg-current-resource nil)
-  (message "ColOrg disabled."))
-
-(defun colorg-toggle-local ()
-  (interactive)
-  (if colorg-current-resource
-      (colorg-local-disable)
-    (colorg-local-enable)))
-
-(colorg-global-enable)
 
 ;;; Coloration matters.
 
@@ -361,6 +314,98 @@ Adapted from Adrian Aichner code, see http://emacswiki.org/emacs/hsv2rgb.el."
           ((= index 3) (list x y value))
           ((= index 4) (list z x value))
           (t (list value x y)))))
+
+;;; Notifications.
+
+(defvar colorg-notification-buffer-name "*colorg-notification*"
+  "Name of ColOrg notification buffer.")
+
+(defvar colorg-notification-is-displayed nil
+  "A notification is currently displayed.")
+
+(defvar colorg-pending-notifications nil
+  "Notifications waiting to be displayed.")
+
+(defun colorg-notify (text)
+  "Manage to notify the user with TEXT as a message."
+  (message "colorg-notify: %s" text)
+  (cond ((eq colorg-notification-timeout 'org)
+         (org-notify text colorg-notification-beep))
+        ((eq colorg-notification-timeout 'ask)
+         (colorg-show-notification text)
+         (read-string "Got it? [Enter] ")
+         (colorg-hide-notification))
+        (t (add-to-list 'colorg-pending-notifications text t)
+           (unless colorg-notification-is-displayed
+             (colorg-advance-notifications)))))
+
+(defun colorg-advance-notifications ()
+  (when colorg-notification-is-displayed
+    (colorg-hide-notification))
+  (when colorg-pending-notifications
+    (colorg-show-notification (pop colorg-pending-notifications))
+    (run-at-time colorg-notification-timeout nil
+                 'colorg-advance-notifications)))
+
+(defun colorg-show-notification (text)
+  "Display TEXT as a notification, in a separate buffer."
+  ;; Adapted from appt.el.
+  (when colorg-notification-beep
+    (beep))
+  (let ((this-window (selected-window))
+        (buffer (get-buffer-create colorg-notification-buffer-name)))
+    ;; Make sure we're not in the minibuffer before splitting the window.
+    (when (minibufferp)
+      (other-window 1)
+      (and (minibufferp) (display-multi-frame-p) (other-frame 1)))
+    (if (cdr (assq 'unsplittable (frame-parameters)))
+        ;; In an unsplittable frame, use something somewhere else.
+	(progn
+	  (set-buffer buffer)
+	  (display-buffer buffer))
+      (unless (or (special-display-p (buffer-name buffer))
+                  (same-window-p (buffer-name buffer)))
+        ;; By default, split the bottom window and use the lower part.
+        (appt-select-lowest-window)
+        ;; Split the window, unless it's too small to do so.
+        (when (>= (window-height) (* 2 window-min-height))
+          (select-window (split-window))))
+      (switch-to-buffer buffer))
+    (setq buffer-read-only nil
+          buffer-undo-list t)
+    (erase-buffer)
+    (insert text)
+    (shrink-window-if-larger-than-buffer (get-buffer-window buffer t))
+    (set-buffer-modified-p nil)
+    (setq buffer-read-only t)
+    (raise-frame (selected-frame))
+    (select-window this-window))
+  (setq colorg-notification-is-displayed t))
+
+(defun colorg-hide-notification ()
+  "Function called to undisplay the notification message."
+  ;; Adapted from appt.el.
+  (setq colorg-notification-is-displayed nil)
+  (let ((window (get-buffer-window colorg-notification-buffer-name t)))
+    (and window
+         (or (eq window (frame-root-window (window-frame window)))
+             (delete-window window))))
+  (kill-buffer colorg-notification-buffer-name))
+
+(defun colorg-select-lowest-window ()
+  "Select the lowest window on the frame."
+  ;; Stolen from appt.el.
+  (let ((lowest-window (selected-window))
+        (bottom-edge (nth 3 (window-edges)))
+        next-bottom-edge)
+    (walk-windows (lambda (window)
+                    (when (< bottom-edge
+                             (setq next-bottom-edge
+                                   (nth 3 (window-edges window))))
+                      (setq bottom-edge next-bottom-edge
+                            lowest-window window)))
+                  'except-minibuffer)
+    (select-window lowest-window)))
 
 (provide 'colorg)
 ;;; colorg.el ends here

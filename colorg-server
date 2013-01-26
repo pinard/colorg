@@ -209,10 +209,8 @@ class User(gevent.Greenlet):
             raise Error("Resource not monitored: %r" % resource)
         resource.alter(start, end, string)
         for client in resource.users:
-            if client is not self:
-                client.outgoing_queue.append(
-                    ('alter', resource.ordinal, start, end, string,
-                     self.ordinal))
+            client.outgoing_queue.append(
+                ('alter', resource.ordinal, start, end, string, self.ordinal))
         return 'done'
 
     def do_chat(self, user, string):
@@ -270,11 +268,40 @@ class User(gevent.Greenlet):
              for key, resource in sorted(Resource.registry.items())]
 
     def do_poll(self, *subcommands):
+        undos = []
+        redos = []
         for command in subcommands:
-            result = self.dispatch(command)
-            if isinstance(result, (str, unicode)):
-                return result
-        queue = self.outgoing_queue
+            if command[0] == 'alter':
+                _, resource, start, end, string = command
+                after = start + len(string)
+                undos.append(['alter', resource, start, start + len(string),
+                              end - start, self.ordinal])
+                for command_0 in self.outgoing_queue:
+                    if command_0[0] == 'alter' and command_0[1] == resource:
+                        # COMMAND_0 should have been done first: so fine tune
+                        # COMMAND to account for this chronological error.
+                        _, _, start_0, end_0, string_0, _ = command_0
+                        # Nothing to do when COMMAND_0 appears textually
+                        # later in the buffer.
+                        if after > start_0:
+                            after_0 = start_0 + len(string_0)
+                            if start > after_0:
+                                # Merely shift if COMMAND_0 appears sooner.
+                                delta = after_0 - end_0
+                                start += delta
+                                end += delta
+                            else:
+                                # There is a clash.  Delete characters no more
+                                # than once and make sure to keep both inserts.
+                                # FIXME:
+                                pass
+                redos.append(['alter', resource, start, end, string])
+            else:
+                raise Error("Expecting an alter command: %r" % command)
+        for command in redos:
+            self.dispatch(command)
+        undos.reverse()
+        queue = undos + self.outgoing_queue
         self.outgoing_queue = []
         if queue:
             return ['exec'] + queue

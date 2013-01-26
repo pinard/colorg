@@ -26,7 +26,7 @@ Emacs Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
 Usage: colorg-server [OPTION]... [HOST] [PORT]
 
 Options:
-  -d   Debug all communication.
+  -d   Debug all communication (double to get the polling as well).
   -h   Print this help, and do nothing else.
 
 If HOST is specified, listen for connections on HOST instead of 0.0.0.0.
@@ -54,7 +54,7 @@ class Warn(Exception):
 
 
 class Main:
-    debug = False
+    debug = 0
     host = '0.0.0.0'
     port = 7997
 
@@ -66,7 +66,7 @@ class Main:
         options, arguments = getopt.getopt(arguments, 'dh')
         for option, value in options:
             if option == '-d':
-                self.debug = True
+                self.debug += 1
             elif option == '-h':
                 sys.stdout.write(__doc__)
                 return
@@ -165,7 +165,7 @@ class User(gevent.Greenlet):
             if not line:
                 self.report("%s Disconnected.", self.report_id)
                 break
-            if run.debug:
+            if run.debug and (run.debug > 1 or line != '"poll"\n'):
                 self.report("%s %s", self.report_id, line.rstrip())
             try:
                 try:
@@ -179,7 +179,7 @@ class User(gevent.Greenlet):
                 result = ['warn', str(exception)]
             text = json.dumps(result)
             assert '\n' not in text, repr(text)
-            if run.debug:
+            if run.debug and (run.debug > 1 or text != '"exec"'):
                 self.report("%s %s", ' ' * len(self.report_id), text)
             self.output.write(text + '\n')
 

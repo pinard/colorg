@@ -332,6 +332,7 @@ Adapted from Adrian Aichner code, see http://emacswiki.org/emacs/hsv2rgb.el."
 (defun colorg-notify (text)
   "Manage to notify the user with TEXT as a message."
   (message "colorg-notify: %s" text)
+  (message "")
   (cond ((eq colorg-notification-timeout 'org)
          (org-notify text colorg-notification-beep))
         ((eq colorg-notification-timeout 'ask)
@@ -375,10 +376,12 @@ Adapted from Adrian Aichner code, see http://emacswiki.org/emacs/hsv2rgb.el."
           (select-window (split-window))))
       (switch-to-buffer buffer))
     (setq buffer-read-only nil
-          buffer-undo-list t)
+          buffer-undo-list t
+          mode-line-format nil)
     (erase-buffer)
     (insert text)
-    (shrink-window-if-larger-than-buffer (get-buffer-window buffer t))
+    (let ((window-min-height 1))
+       (shrink-window-if-larger-than-buffer (get-buffer-window buffer t)))
     (set-buffer-modified-p nil)
     (setq buffer-read-only t)
     (raise-frame (selected-frame))

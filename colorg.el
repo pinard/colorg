@@ -76,8 +76,38 @@ kept on one of more servers.")
 
 (make-variable-buffer-local 'colorg-current-resource)
 
-(defvar colorg-nickname-already-transmitted nil
-  "Temporary kludge.")
+(defvar colorg-my-login-number nil
+  "The login number for the local user in this buffer.")
+
+(define-minor-mode colorg-mode
+  "Collaborative editing mode.
+
+See https://github.com/pinard/colorg/wiki/ for more information."
+  nil " co" nil
+  (when colorg-mode
+    (condition-case error-info
+        (let (resources)
+          (unless colorg-my-login-number
+            (setq colorg-my-login-number
+                  (car (colorg-ask-server
+                        (list 'login colorg-user-nickname)))))
+          (let ((name (read-string "Resource name? ")))
+            (when (string-equal name "")
+              (setq name (buffer-name)))
+            (if (= (point-min) (point-max))
+                (let ((values (colorg-ask-server (list 'join name md5sum))))
+                  (unless values
+                    (error "Resource could not be joined."))
+                  (setq colorg-current-resource (car values)))
+              (let ((values (colorg-ask-server (list 'create name))))
+                (unless values
+                  (error "Resource could not be created."))
+                (setq colorg-current-resource (car values))))
+            (push (list 'alter colorg-current-resource (point-min) (point-min)
+                        (buffer-substring-no-properties (point-min) (point-max)))
+                  colorg-outgoing-list)))
+      (error (setq colorg-mode nil)
+             (error "%S" (cdr error-info))))))
 
 (defun colorg-global-enable ()
   (interactive)
@@ -91,39 +121,6 @@ kept on one of more servers.")
   (interactive)
   (remove-hook 'after-change-functions 'colorg-after-change-routine)
   (cancel-timer colorg-idle-timer))
-
-(defun colorg-local-enable ()
-  (interactive)
-  (unless colorg-nickname-already-transmitted
-    (colorg-ask-server(list 'login colorg-user-nickname))
-    (setq colorg-nickname-already-transmitted t))
-  (let ((name (read-string "Resource name? ")))
-    (when (string-equal name "")
-      (setq name (buffer-name)))
-    (if (= (point-min) (point-max))
-        (let ((values (colorg-ask-server (list 'join name md5sum))))
-          (unless values
-            (error "Resource could not be joined."))
-          (setq colorg-current-resource (car values)))
-      (let ((values (colorg-ask-server (list 'create name))))
-        (unless values
-          (error "Resource could not be created."))
-      (setq colorg-current-resource (car values))))
-    (push (list 'alter colorg-current-resource (point-min) (point-min)
-                (buffer-substring-no-properties (point-min) (point-max)))
-          colorg-outgoing-list)
-    (message "ColOrg enabled.")))
-
-(defun colorg-local-disable ()
-  (interactive)
-  (setq colorg-current-resource nil)
-  (message "ColOrg disabled."))
-
-(defun colorg-toggle ()
-  (interactive)
-  (if colorg-current-resource
-      (colorg-local-disable)
-    (colorg-local-enable)))
 
 (colorg-global-enable)
 
@@ -176,7 +173,7 @@ kept on one of more servers.")
            (setq values (append (mapcar 'colorg-process arguments))))
           ((eq action 'error)
            (let ((string (nth 0 arguments)))
-             (colorg-local-disable)
+             (colorg-mode 0)
              (colorg-notify
               (concat
                (propertize "Error (disabling): " 'face 'font-lock-warning-face)
@@ -195,7 +192,7 @@ kept on one of more servers.")
 (defun colorg-after-change-routine (start end deleted)
   "After any buffer change, tell the server about the alter to do.
 These commands are accumulated and sent at regular intervals."
-  (when colorg-current-resource
+  (when colorg-mode
     ;; Combine a pure insert with a previous alter, whenever possible.
     (let ((info (and colorg-outgoing-list
                      (zerop deleted)
@@ -258,7 +255,7 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
       (let ((here (point)))
         (accept-process-output colorg-process colorg-accept-timeout)
         (when (= here (point-max))
-          (colorg-local-disable)
+          (colorg-mode 0)
           (error "colorg disabled: server does not seem to reply.")))
       (goto-char (point-min)))
     (goto-char (point-min))

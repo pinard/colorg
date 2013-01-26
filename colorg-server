@@ -18,10 +18,10 @@
 # Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.  */
 
 """\
-ColOrg server, to orchestrate collobaration between many ColOrg users.
+colorg server, to orchestrate collobaration between many colorg users.
 
-ColOrg is a real-time collaborative editing tool originally meant for
-Emacs Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
+colorg is a real-time collaborative editing tool originally meant for
+Emacs Org mode users.  See https://github.com/pinard/colorg/wiki/.
 
 Usage: colorg-server [OPTION]... [HOST] [PORT]
 
@@ -93,7 +93,7 @@ class Main:
         handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         handle.bind((self.host, self.port))
         handle.listen(1)
-        self.report("ColOrg server accepting connections on %s, port %d.",
+        self.report("colorg server accepting connections on %s, port %d.",
                     self.host, self.port)
         while True:
             handle2, address = handle.accept()

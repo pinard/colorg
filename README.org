@@ -1,12 +1,10 @@
-#+TITLE: ColOrg — Collaborative tools for Emacs Org
+#+TITLE: colorg — Collaborative tools for Emacs Org
 #+OPTIONS: H:2
-#+SETUPFILE: ~/fp/notes/setup/nodemacs.org
-#+INCLUDE: ~/fp/notes/setup/jqindex.org
 
   *Note: This project is in the state of the initial writing, and is not usable yet.*
 
 This project aims a real-time collaboration between people editing Org files using Emacs Org mode.  Yet, it may also be used for other Emacs buffers.  It is not even Emacs specific, in that it might eventually be extended to other tools.
 
-The initial goal is to lay out some analysis about how we could first get some solution, with the intent of refining it later, rather than directly aiming the ideal setup.  The [[https://github.com/pinard/ColOrg/wiki][Colorg Wiki]] contains exchanges taken from the Org mailing list, ongoing pointers, related matters, as well as [[https://github.com/pinard/ColOrg/wiki/Usage][usage instructions]].
+The initial goal is to lay out some analysis about how we could first get some solution, with the intent of refining it later, rather than directly aiming the ideal setup.  The [[https://github.com/pinard/colorg/wiki][*colorg* Wiki]] contains exchanges taken from the Org mailing list, ongoing pointers, related matters, as well as [[https://github.com/pinard/colorg/wiki/Usage][usage instructions]].
 
 François

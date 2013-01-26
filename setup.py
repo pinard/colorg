@@ -16,12 +16,12 @@
 
 from setuptools import setup
 
-setup(name='ColOrg',
+setup(name='colorg',
       version='0.0',
       description="Server for real-time collaborative edition of Org files.",
       author=u"François Pinard",
       author_email='pinard@iro.umontreal.ca',
-      url='https://github.com/pinard/ColOrg',
+      url='https://github.com/pinard/colorg',
       install_requires=['gevent'],
       scripts=['colorg-server'],
       license='GPLv3'

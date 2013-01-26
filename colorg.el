@@ -24,8 +24,8 @@
 
 ;;; Commentary:
 
-;; ColOrg is a real-time collaborative editing tool meant for Emacs
-;; Org mode users.  See https://github.com/pinard/ColOrg/wiki/.
+;; colorg is a real-time collaborative editing tool meant for Emacs
+;; Org mode users.  See https://github.com/pinard/colorg/wiki/.
 
 ;; At this stage, the tool is aiming simplicity: the idea is to
 ;; quickly get a working prototype.  All collaborating users are
@@ -44,10 +44,10 @@
   "Name by which this user is identified to other collaborators.")
 
 (defvar colorg-accept-timeout 5
-  "Number of seconds to wait after the ColOrg server.")
+  "Number of seconds to wait after the colorg server.")
 
 (defvar colorg-idle-timeout 2
-  "Number of quiescent second before polling the ColOrg server.")
+  "Number of quiescent second before polling the colorg server.")
 
 (defvar colorg-hue-bias (progn (random t) (* 0.00001 (random 100000)))
   "Bias for hue, so colors are never predictable between Emacs sessions.
@@ -139,7 +139,7 @@ kept on one of more servers.")
   (colorg-process (colorg-round-trip command)))
 
 (defun colorg-process (command)
-  "Process COMMAND as received from the ColOrg server, then return values."
+  "Process COMMAND as received from the colorg server, then return values."
   (let (action arguments values)
     (if (stringp command)
         (setq action (intern command)
@@ -236,7 +236,7 @@ This is a reversed list, the most recent command appears first.
 These are sent to the server whenever Emacs gets idle for a jiffie.")
 
 ;; FIXME: Should have one such buffer per server.
-(defvar colorg-buffer-name "*ColOrg*")
+(defvar colorg-buffer-name "*colorg*")
 (defvar colorg-process nil)
 (defvar colorg-buffer nil)
 
@@ -259,7 +259,7 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
         (accept-process-output colorg-process colorg-accept-timeout)
         (when (= here (point-max))
           (colorg-local-disable)
-          (error "ColOrg disabled: server does not seem to reply.")))
+          (error "colorg disabled: server does not seem to reply.")))
       (goto-char (point-min)))
     (goto-char (point-min))
     (let ((json-array-type 'list)) (json-read))))
@@ -321,7 +321,7 @@ Adapted from Adrian Aichner code, see http://emacswiki.org/emacs/hsv2rgb.el."
 ;;; Notifications.
 
 (defvar colorg-notification-buffer-name "*colorg-notification*"
-  "Name of ColOrg notification buffer.")
+  "Name of colorg notification buffer.")
 
 (defvar colorg-notification-is-displayed nil
   "A notification is currently displayed.")

@@ -49,6 +49,11 @@
 (defvar colorg-idle-timeout 2
   "Number of quiescent second before polling the ColOrg server.")
 
+(defvar colorg-hue-bias (progn (random t) (* 0.00001 (random 100000)))
+  "Bias for hue, so colors are never predictable between Emacs sessions.
+You may change that to a floating constant between 0.0 and 1.0 (excluded)
+if you always want the same colors for the same user numbers.")
+
 (defvar colorg-notification-timeout 4
   "Number of seconds to keep each notification displayed.
 Instead of a number, the value 'ask waits for the user to type Enter.
@@ -262,9 +267,6 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
 
 (defconst colorg-phi (* 0.5 (1+ (sqrt 5)))
   "Golden ratio.")
-
-(defvar colorg-hue-bias (progn (random t) (* 0.00001 (random 100000)))
-  "Bias for hue, so colors are never predictable.")
 
 (defvar colorg-overlays nil
   "Association between keys and overlays.")

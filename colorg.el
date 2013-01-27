@@ -46,7 +46,7 @@
 (defvar colorg-accept-timeout 5
   "Number of seconds to wait after the colorg server.")
 
-(defvar colorg-idle-timeout 2
+(defvar colorg-idle-timeout 1
   "Number of quiescent second before polling the colorg server.")
 
 (defvar colorg-hue-bias (progn (random t) (* 0.00001 (random 100000)))

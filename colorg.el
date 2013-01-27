@@ -64,17 +64,12 @@ The special value 'org rather requests Org notifications.")
 
 ;;; Activation and deactivation.
 
-(defvar colorg-current-resource nil
-  "Description of the synchronized resource for the current buffer.
-
-The value is t when the buffer is synchronized, nil otherwise.
-Currently, the code takes care of a single resource on a single
-server.  This variable is meant to contain a description of the
-server and the resource on that server, for when the tool will be
-able to relate many synchronized buffers at once to resources
-kept on one of more servers.")
-
-(make-variable-buffer-local 'colorg-current-resource)
+(defvar colorg-data nil
+  "List of (BUFFER RESOURCE SERVER) triplets.
+A monitored BUFFER is associated to a RESOURCE number and a SERVER connection.
+Both are needed: as each server uses it own numbering, numbers may clash.
+This COLORG-DATA structure replaces buffer-local variables which would be
+more attractive, if only major modes did not tamper with them unexpectedly.")
 
 (defvar colorg-my-login-number nil
   "The login number for the local user in this buffer.")
@@ -84,30 +79,20 @@ kept on one of more servers.")
 
 See https://github.com/pinard/colorg/wiki/ for more information."
   nil " co" nil
-  (when colorg-mode
-    (condition-case error-info
-        (let (resources)
-          (unless colorg-my-login-number
-            (setq colorg-my-login-number
-                  (car (colorg-ask-server
-                        (list 'login colorg-user-nickname)))))
-          (let ((name (read-string "Resource name? ")))
-            (when (string-equal name "")
-              (setq name (buffer-name)))
-            (if (= (point-min) (point-max))
-                (let ((values (colorg-ask-server (list 'join name md5sum))))
-                  (unless values
-                    (error "Resource could not be joined."))
-                  (setq colorg-current-resource (car values)))
-              (let ((values (colorg-ask-server (list 'create name))))
-                (unless values
-                  (error "Resource could not be created."))
-                (setq colorg-current-resource (car values))))
-            (push (list 'alter colorg-current-resource (point-min) (point-min)
-                        (buffer-substring-no-properties (point-min) (point-max)))
-                  colorg-outgoing-list)))
-      (error (setq colorg-mode nil)
-             (error "%S" (cdr error-info))))))
+  (if colorg-mode
+      (condition-case err
+          (progn
+            (unless colorg-my-login-number
+              (setq colorg-my-login-number
+                    (car (colorg-ask-server
+                          (list 'login colorg-user-nickname)))))
+            (push (list (current-buffer) (colorg-associate-resource) nil)
+                  colorg-data))
+        (error (setq colorg-mode nil)
+               (error "Error activating colorg: %s"
+                      (error-message-string err))))
+    (setq colorg-data (delq (assq (current-buffer) colorg-data)
+                            colorg-data))))
 
 (defun colorg-global-enable ()
   (interactive)
@@ -125,6 +110,51 @@ See https://github.com/pinard/colorg/wiki/ for more information."
 (colorg-global-enable)
 
 ;;; Command processing.
+
+(defun colorg-associate-resource ()
+  "Select a resource interactively, then return its number.
+If the resource already exists, associate the current buffer with
+the resource if the contents match.  If they do not match and the
+buffer is empty, download the resource in the buffer.  Otherwise,
+create a new resource and upload its contents from the buffer."
+  (let* ((pairs (colorg-ask-server 'resources))
+         (name (and pairs
+                    (completing-read "Existing resource? " pairs nil t)))
+         resource)
+    (if (and name (not (string-equal name "")))
+        (let ((md5sum
+               (let ((output (generate-new-buffer " *md5sum*")))
+                 (unwind-protect
+                     (progn
+                       (call-process-region
+                        (point-min) (point-max) "md5sum" nil output)
+                       (save-excursion
+                         (set-buffer output)
+                         (goto-char (point-max))
+                         (skip-chars-backward "- \n")
+                         (buffer-substring-no-properties (point-min) (point))))
+                   (kill-buffer output)))))
+          (setq resource (car (colorg-ask-server (list 'join name md5sum)))))
+      (setq name (read-string "New resource name? " nil nil (buffer-name)))
+      (when (assoc name pairs)
+        (error "This resource already exists."))
+      (setq resource (car (colorg-ask-server (list 'create name))))
+      (push (list 'alter resource (point-min) (point-min)
+                  (buffer-substring-no-properties (point-min) (point-max)))
+            colorg-outgoing-list))
+    resource))
+
+(defun colorg-select-resource ()
+  "Select a resource interactively, return its number, else nil."
+  (let* ((pairs (colorg-ask-server 'resources))
+         (name (completing-read "Which resource? " pairs nil t)))
+    (and name (cadr (assoc name pairs)))))
+
+(defun colorg-select-user ()
+  "Select a user interactively, return its number, else nil."
+  (let* ((pairs (colorg-ask-server 'users))
+         (name (completing-read "Which user? " pairs nil t)))
+    (and name (cadr (assoc name pairs)))))
 
 (defun colorg-send-message (text)
   (interactive)
@@ -194,17 +224,19 @@ See https://github.com/pinard/colorg/wiki/ for more information."
 These commands are accumulated and sent at regular intervals."
   (when colorg-mode
     ;; Combine a pure insert with a previous alter, whenever possible.
-    (let ((info (and colorg-outgoing-list
-                     (zerop deleted)
-                     (eq (caar colorg-outgoing-list) 'alter)
-                     (= (cadar colorg-outgoing-list) colorg-current-resource)
-                     (cddar colorg-outgoing-list))))
+    (let* ((data (assq (current-buffer) colorg-data))
+           (resource (cadr data))
+           (server (caddr data))
+           (info (and colorg-outgoing-list
+                      (zerop deleted)
+                      (eq (caar colorg-outgoing-list) 'alter)
+                      (= (cadar colorg-outgoing-list) resource)
+                      (cddar colorg-outgoing-list))))
       (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
           (setcar (cddr info)
                   (concat (caddr info)
                              (buffer-substring-no-properties start end)))
-        (push (list 'alter colorg-current-resource
-                    (1- start) (+ (1- start) deleted)
+        (push (list 'alter resource (1- start) (+ (1- start) deleted)
                     (buffer-substring-no-properties start end))
               colorg-outgoing-list)))))
 

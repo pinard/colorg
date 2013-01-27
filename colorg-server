@@ -97,10 +97,207 @@ class Main:
                     self.host, self.port)
         while True:
             handle2, address = handle.accept()
-            User(handle2, *address).start()
+            Client(handle2, *address).start()
 
     def report(self, format, *arguments):
         sys.stderr.write('%s\n' % (format % arguments).rstrip())
+
+
+class Client(gevent.Greenlet):
+    user = None
+
+    def __init__(self, handle, host, port):
+        super(Client, self).__init__()
+        self.input = handle.makefile()
+        self.output = handle.makefile('w', 0)
+        self.host = host
+        self.port = port
+        self.report("%r Incoming connection.", self)
+        # User commands waiting to be processed on the server.
+        self.incoming_queue = []
+        # Server commands waiting to be polled and read by the client.
+        self.outgoing_queue = []
+
+    def __repr__(self):
+        if self.user is None:
+            text = ''
+        else:
+            text = '%s ' % self.user.name
+        if self.host != '127.0.0.1':
+            text += '%s ' % self.host
+        return '%s:%d' % (text, self.port)
+
+    def _run(self):
+
+        # Process incoming commands.
+        while True:
+            line = self.input.readline()
+            if not line:
+                self.report("%r Disconnected.", self)
+                break
+            if run.debug and (run.debug > 1 or line != '"poll"\n'):
+                self.report("%r %s", self, line.rstrip())
+            try:
+                try:
+                    command = json.loads(line)
+                except ValueError, exception:
+                    raise Warn(str(exception))
+                result = self.dispatch(command)
+            except Error, exception:
+                result = ['error', str(exception)]
+            except Warn, exception:
+                result = ['warn', str(exception)]
+            text = json.dumps(result)
+            assert '\n' not in text, repr(text)
+            if run.debug and (run.debug > 1 or text != '"exec"'):
+                self.report("%s %s", ' ' * len(repr(self)), text)
+            self.output.write(text + '\n')
+
+        # Leave all resources.
+        for resource in Resource.registry.itervalues():
+            if self in resource.users:
+                resource.users.remove(self)
+
+    def dispatch(self, command):
+        if command and isinstance(command, list):
+            action = command[0]
+            arguments = command[1:]
+        else:
+            action = command
+            arguments = ()
+        processor = getattr(self, 'do_%s' % action, None)
+        if processor is None:
+            raise Warn("Unrecognized command: %r" % command)
+        try:
+            return processor(*arguments)
+        except TypeError, exception:
+            raise Warn(str(exception))
+
+    def do_alter(self, resource, start, end, string):
+        resource = self.resolve_resource(resource)
+        if self not in resource.users:
+            raise Error("Resource not monitored: %r" % resource)
+        resource.alter(start, end, string)
+        for client in resource.users:
+            client.outgoing_queue.append(
+                ('alter', resource.ordinal, start, end, string,
+                 self.user.ordinal))
+        return 'done'
+
+    def do_chat(self, user, string):
+        user = self.resolve_user(user)
+        user.outgoing_queue.append(['chat', self.user.ordinal, string])
+        return 'done'
+
+    def do_create(self, name):
+        if not isinstance(name, (str, unicode)):
+            raise Warn("Name should be a string: %r" % name)
+        if Resource.get(name) is not None:
+            raise Warn("Resource name already taken: %r" % name)
+        resource = Resource(name)
+        resource.users.append(self)
+        return ['done', resource.ordinal]
+
+    def do_join(self, resource, md5sum):
+        resource = self.resolve_resource(resource)
+        if self in resource.users:
+            raise Warn("Already monitoring: %r" % resource)
+        if md5sum == md5_empty:
+            self.outgoing_queue.append(
+                ('alter', resource.ordinal, 0, 0, resource.get_contents(), 0))
+        elif md5sum != resource.md5sum():
+            raise Warn("Checksum mismatch: %r %s here, %s remotely."
+                       % (resource, resource.md5sum(), md5sum))
+        resource.users.append(self)
+        return ['done', resource.ordinal]
+
+    def do_leave(self, resource):
+        resource = self.resolve_resource(resource)
+        if self not in resource.users:
+            raise Warn("Was not monitoring: %r" % resource)
+        resource.users.remove(self)
+        return 'done'
+
+    def do_login(self, name):
+        if not isinstance(name, (str, unicode)):
+            raise Warn("Name should be a string: %r" % name)
+        self.user = User.get(name)
+        if self.user is None:
+            self.user = User(name)
+        return ['done', self.user.ordinal]
+
+    def do_logout(self):
+        if self.user is None:
+            raise Warn("Not logged in: %r" % self)
+        del self.user
+        return 'done'
+
+    def do_resources(self):
+        return ['done'] + [
+            [resource.name, key]
+             for key, resource in sorted(Resource.registry.items())]
+
+    def do_poll(self, *subcommands):
+        undos = []
+        redos = []
+        for command in subcommands:
+            if command[0] == 'alter':
+                _, resource, start, end, string = command
+                after = start + len(string)
+                undos.append(['alter', resource, start, start + len(string),
+                              end - start, self.user.ordinal])
+                for command_0 in self.outgoing_queue:
+                    if command_0[0] == 'alter' and command_0[1] == resource:
+                        # COMMAND_0 should have been done first: so fine tune
+                        # COMMAND to account for this chronological error.
+                        _, _, start_0, end_0, string_0, _ = command_0
+                        # Nothing to do when COMMAND_0 appears textually
+                        # later in the buffer.
+                        if after > start_0:
+                            after_0 = start_0 + len(string_0)
+                            if start > after_0:
+                                # Merely shift if COMMAND_0 appears sooner.
+                                delta = after_0 - end_0
+                                start += delta
+                                end += delta
+                            else:
+                                # There is a clash.  Delete characters no more
+                                # than once and make sure to keep both inserts.
+                                # FIXME:
+                                pass
+                redos.append(['alter', resource, start, end, string])
+            else:
+                raise Error("Expecting an alter command: %r" % command)
+        for command in redos:
+            self.dispatch(command)
+        undos.reverse()
+        queue = undos + self.outgoing_queue
+        self.outgoing_queue = []
+        if queue:
+            return ['exec'] + queue
+        return 'exec'
+
+    def do_users(self):
+        return ['done'] + [
+            [client.name, key]
+             for key, client in sorted(User.registry.items())]
+
+    def report(self, format, *arguments):
+        now = datetime.datetime.now().time()
+        run.report('%.2d:%.2d:%.2d ' + format,
+                   now.hour, now.minute, now.second, *arguments)
+
+    def resolve_resource(self, resource):
+        found = Resource.get(resource)
+        if found is None:
+            raise Warn("Resource not found: %r" % resource)
+        return found
+
+    def resolve_user(self, user):
+        found = User.get(user)
+        if found is None:
+            raise Warn("User not found: %r" % user)
+        return found
 
 
 class Resource:
@@ -136,181 +333,15 @@ class Resource:
         return hashlib.md5(self.contents).hexdigest()
 
 
-class User(gevent.Greenlet):
-    name = "Anonymous"
+class User:
     ordinal = 0
     registry = {}
 
-    def __init__(self, handle, host, port):
+    def __init__(self, name):
+        self.name = name
         self.ordinal = User.ordinal
         User.ordinal += 1
         User.registry[self.ordinal] = self
-        super(User, self).__init__()
-        self.input = handle.makefile()
-        self.output = handle.makefile('w', 0)
-        self.host = host
-        self.port = port
-        self.report_id = '%s:%d' % (host, port)
-        self.report("%s Incoming connection.", self.report_id)
-        # User commands waiting to be processed on the server.
-        self.incoming_queue = []
-        # Server commands waiting to be polled and read by the client.
-        self.outgoing_queue = []
-
-    def _run(self):
-
-        # Process incoming commands.
-        while True:
-            line = self.input.readline()
-            if not line:
-                self.report("%s Disconnected.", self.report_id)
-                break
-            if run.debug and (run.debug > 1 or line != '"poll"\n'):
-                self.report("%s %s", self.report_id, line.rstrip())
-            try:
-                try:
-                    command = json.loads(line)
-                except ValueError, exception:
-                    raise Warn(str(exception))
-                result = self.dispatch(command)
-            except Error, exception:
-                result = ['error', str(exception)]
-            except Warn, exception:
-                result = ['warn', str(exception)]
-            text = json.dumps(result)
-            assert '\n' not in text, repr(text)
-            if run.debug and (run.debug > 1 or text != '"exec"'):
-                self.report("%s %s", ' ' * len(self.report_id), text)
-            self.output.write(text + '\n')
-
-        # Leave all resources.
-        for resource in Resource.registry.itervalues():
-            if self in resource.users:
-                resource.users.remove(self)
-
-    def dispatch(self, command):
-        if command and isinstance(command, list):
-            action = command[0]
-            arguments = command[1:]
-        else:
-            action = command
-            arguments = ()
-        processor = getattr(self, 'do_%s' % action, None)
-        if processor is None:
-            raise Warn("Unrecognized command: %r" % command)
-        try:
-            return processor(*arguments)
-        except TypeError, exception:
-            raise Warn(str(exception))
-
-    def do_alter(self, resource, start, end, string):
-        resource = self.resolve_resource(resource)
-        if self not in resource.users:
-            raise Error("Resource not monitored: %r" % resource)
-        resource.alter(start, end, string)
-        for client in resource.users:
-            client.outgoing_queue.append(
-                ('alter', resource.ordinal, start, end, string, self.ordinal))
-        return 'done'
-
-    def do_chat(self, user, string):
-        user = self.resolve_user(user)
-        user.outgoing_queue.append(['chat', self.ordinal, string])
-        return 'done'
-
-    def do_create(self, name):
-        if not isinstance(name, (str, unicode)):
-            raise Warn("Name should be a string: %r" % name)
-        if Resource.get(name) is not None:
-            raise Warn("Resource name already taken: %r" % name)
-        resource = Resource(name)
-        resource.users.append(self)
-        return ['done', resource.ordinal]
-
-    def do_join(self, resource, md5sum):
-        resource = self.resolve_resource(resource)
-        if self in resource.users:
-            raise Warn("Already monitoring: %r" % resource)
-        if md5sum == md5_empty:
-            self.outgoing_queue.append(
-                ('alter', resource.ordinal, 0, 0, resource.get_contents(), 0))
-        elif md5sum != resource.md5sum():
-            raise Warn("Checksums do not match: %r %s here, %s remotely."
-                       % resource, resource.md5sum(), md5sum)
-        resource.users.append(self)
-        return ['done', resource.ordinal]
-
-    def do_leave(self, resource):
-        resource = self.resolve_resource(resource)
-        if self not in resource.users:
-            raise Warn("Was not monitoring: %r" % resource)
-        resource.users.remove(self)
-        return 'done'
-
-    def do_login(self, name):
-        if not isinstance(name, (str, unicode)):
-            raise Warn("Name should be a string: %r" % name)
-        if User.get(name) is not None:
-            raise Warn("User name already taken: %r" % name)
-        self.name = name
-        self.report_id = name
-        return ['done', self.ordinal]
-
-    def do_logout(self):
-        if self.name is User.name:
-            raise Warn("Not logged in: %r" % self)
-        del self.name
-        return ['done', self.ordinal]
-
-    def do_resources(self):
-        return ['done'] + [
-            [key, resource.name]
-             for key, resource in sorted(Resource.registry.items())]
-
-    def do_poll(self, *subcommands):
-        undos = []
-        redos = []
-        for command in subcommands:
-            if command[0] == 'alter':
-                _, resource, start, end, string = command
-                after = start + len(string)
-                undos.append(['alter', resource, start, start + len(string),
-                              end - start, self.ordinal])
-                for command_0 in self.outgoing_queue:
-                    if command_0[0] == 'alter' and command_0[1] == resource:
-                        # COMMAND_0 should have been done first: so fine tune
-                        # COMMAND to account for this chronological error.
-                        _, _, start_0, end_0, string_0, _ = command_0
-                        # Nothing to do when COMMAND_0 appears textually
-                        # later in the buffer.
-                        if after > start_0:
-                            after_0 = start_0 + len(string_0)
-                            if start > after_0:
-                                # Merely shift if COMMAND_0 appears sooner.
-                                delta = after_0 - end_0
-                                start += delta
-                                end += delta
-                            else:
-                                # There is a clash.  Delete characters no more
-                                # than once and make sure to keep both inserts.
-                                # FIXME:
-                                pass
-                redos.append(['alter', resource, start, end, string])
-            else:
-                raise Error("Expecting an alter command: %r" % command)
-        for command in redos:
-            self.dispatch(command)
-        undos.reverse()
-        queue = undos + self.outgoing_queue
-        self.outgoing_queue = []
-        if queue:
-            return ['exec'] + queue
-        return 'exec'
-
-    def do_users(self):
-        return ['done'] + [
-            [key, client.name]
-             for key, client in sorted(User.registry.items())]
 
     @staticmethod
     def get(name):
@@ -319,23 +350,6 @@ class User(gevent.Greenlet):
         for key, client in User.registry.iteritems():
             if name == client.name:
                 return client
-
-    def report(self, format, *arguments):
-        now = datetime.datetime.now().time()
-        run.report('%.2d:%.2d:%.2d ' + format,
-                   now.hour, now.minute, now.second, *arguments)
-
-    def resolve_resource(self, resource):
-        found = Resource.get(resource)
-        if found is None:
-            raise Warn("Resource not found: %r" % resource)
-        return found
-
-    def resolve_user(self, user):
-        found = User.get(user)
-        if found is None:
-            raise Warn("User not found: %r" % user)
-        return found
 
 
 run = Main()

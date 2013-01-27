@@ -277,7 +277,8 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
                (eq (process-status colorg-process) 'open))
     (setq colorg-buffer (get-buffer-create colorg-buffer-name))
     (setq colorg-process
-          (open-network-stream "essai" colorg-buffer "localhost" 7997)))
+          (open-network-stream "essai" colorg-buffer "localhost" 7997))
+    (set-process-query-on-exit-flag colorg-process nil))
   (save-excursion
     (set-buffer colorg-buffer)
     (erase-buffer)

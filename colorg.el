@@ -76,21 +76,25 @@ more attractive, if only major modes did not tamper with them unexpectedly.")
 
 (define-minor-mode colorg-mode
   "Collaborative editing mode.
-
 See https://github.com/pinard/colorg/wiki/ for more information."
   nil " co" nil
   (if colorg-mode
       (condition-case err
-          (progn
-            (unless colorg-my-login-number
-              (setq colorg-my-login-number
-                    (car (colorg-ask-server
-                          (list 'login colorg-user-nickname)))))
-            (push (list (current-buffer) (colorg-associate-resource) nil)
+          (let ((server (colorg-select-server)))
+            (save-excursion
+              (set-buffer server)
+              (setq colorg-my-login-number co-user))
+            (push (list (current-buffer) (colorg-associate-resource) server)
                   colorg-data))
-        (error (setq colorg-mode nil)
-               (error "Error activating colorg: %s"
+        (error (let ((data (assq (current-buffer) colorg-data)))
+                 (when data
+                   (colorg-ask-server (list 'leave (nth 1 data)))))
+               (setq colorg-mode nil)
+               (error "Error in colorg activation: %s"
                       (error-message-string err))))
+    (let ((data (assq (current-buffer) colorg-data)))
+      (when data
+        (colorg-ask-server (list 'leave (nth 1 data)))))
     (setq colorg-data (delq (assq (current-buffer) colorg-data)
                             colorg-data))))
 
@@ -163,9 +167,9 @@ create a new resource and upload its contents from the buffer."
 
 (defun colorg-ask-server (command)
   "Send COMMAND to server, receive and process reply, then return values."
-  (colorg-process (colorg-round-trip command)))
+  (colorg-reply-handler (colorg-round-trip command)))
 
-(defun colorg-process (command)
+(defun colorg-reply-handler (command)
   "Process COMMAND as received from the colorg server, then return values."
   (let (action arguments values)
     (if (stringp command)
@@ -200,7 +204,7 @@ create a new resource and upload its contents from the buffer."
           ((eq action 'done)
            (setq values arguments))
           ((eq action 'exec)
-           (setq values (append (mapcar 'colorg-process arguments))))
+           (setq values (append (mapcar 'colorg-reply-handler arguments))))
           ((eq action 'error)
            (let ((string (nth 0 arguments)))
              (colorg-mode 0)
@@ -254,7 +258,10 @@ triggered alter commands from the server and execute them all."
       ;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
       values)))
 
-;;; Communication protocol.
+;;; Servers and communication.
+
+(defvar colorg-server-buffers nil
+  "Association list relating server names to server buffers.")
 
 (defvar colorg-idle-timer nil
   "Timer used to detect the quiescence of Emacs.")
@@ -271,14 +278,44 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
 
 (require 'json)
 
+(defun colorg-select-server ()
+  "Select a server interactively, and return its buffer.
+If the server does not exist yet, create it."
+  (let* ((name (completing-read "Which server? " colorg-server-buffers))
+         (pair (assoc name colorg-server-buffers)))
+    (unless pair
+      (when (string-equal name "")
+        (cond ((not colorg-server-buffers)
+               (setq name "local"))
+              ((= (length colorg-server-buffers) 1)
+               (setq pair (car colorg-server-buffers)
+                     name (car pair)))
+              (t (error "Many servers, please select one."))))
+      (unless pair
+        (let ((host (read-string (format "Server %s host? " name)
+                                 "localhost"))
+              (port (string-to-number
+                     (read-string (format "Server %s port? " name)
+                                  "7997")))
+              (buffer (get-buffer-create (format " *colorg %s*" name))))
+          (save-excursion
+            (set-buffer buffer)
+            (set (make-local-variable 'co-name) name)
+            (set (make-local-variable 'co-process)
+                 (open-network-stream name buffer host port))
+            (set-process-query-on-exit-flag co-process nil)
+            (setq colorg-buffer buffer
+                  colorg-process co-process)
+            (set (make-local-variable 'co-alist) nil)
+            (set (make-local-variable 'co-outgoing) nil)
+            (set (make-local-variable 'co-user)
+                 (car (colorg-ask-server
+                       (list 'login colorg-user-nickname)))))
+          (setq pair (cons name buffer))
+          (push pair colorg-server-buffers))))
+    (cdr pair)))
+
 (defun colorg-round-trip (data)
-  (unless (and (processp colorg-process)
-               ;; FIXME: Because I restart the server?  Not healthy!
-               (eq (process-status colorg-process) 'open))
-    (setq colorg-buffer (get-buffer-create colorg-buffer-name))
-    (setq colorg-process
-          (open-network-stream "essai" colorg-buffer "localhost" 7997))
-    (set-process-query-on-exit-flag colorg-process nil))
   (save-excursion
     (set-buffer colorg-buffer)
     (erase-buffer)
@@ -292,7 +329,8 @@ These are sent to the server whenever Emacs gets idle for a jiffie.")
           (error "colorg disabled: server does not seem to reply.")))
       (goto-char (point-min)))
     (goto-char (point-min))
-    (let ((json-array-type 'list)) (json-read))))
+    (let ((json-array-type 'list))
+      (json-read))))
 
 ;;; Coloration matters.
 

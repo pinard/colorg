@@ -244,18 +244,16 @@ These commands are accumulated and sent at regular intervals."
   "Whenever Emacs gets idle, round-trip with the synchronization server.
 We push out accumulated commands.  Then, we get externally
 triggered alter commands from the server and execute them all."
-  (let (outgoing)
-    (save-excursion
-      (set-buffer colorg-buffer)
-      (setq outgoing co-outgoing)
-      (setq co-outgoing nil))
-    (let ((values
-           (save-match-data
-             (colorg-ask-server (if outgoing
-                                    (cons 'poll (nreverse outgoing))
-                                  'poll)))))
-      ;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
-      values)))
+  (save-match-data
+    (let (outgoing)
+      (save-excursion
+        (set-buffer colorg-buffer)
+        (setq outgoing co-outgoing)
+        (setq co-outgoing nil))
+      (colorg-ask-server (if outgoing
+                             (cons 'poll (nreverse outgoing))
+                           'poll)))))
+;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
 
 ;;; Servers and communication.
 
@@ -265,12 +263,12 @@ triggered alter commands from the server and execute them all."
 (defvar colorg-idle-timer nil
   "Timer used to detect the quiescence of Emacs.")
 
-;;(defvar colorg-outgoing-list nil
+;; Local variables to server buffers:
+
+;;(defvar co-outgoing nil
 ;;  "Accumulated alter commands meant to be broadcasted.
 ;;This is a reversed list, the most recent command appears first.
 ;;These are sent to the server whenever Emacs gets idle for a jiffie.")
-
-(defvar colorg-buffer nil)
 
 (require 'json)
 
@@ -313,6 +311,10 @@ If the server does not exist yet, create it."
 (defun colorg-round-trip (data)
   (save-excursion
     (set-buffer colorg-buffer)
+      (unless (and (processp co-process)
+                   ;; FIXME: Because I restart the server?  Not healthy!
+                   (eq (process-status co-process) 'open))
+        (error "Server %s process vanished." co-name))
     (erase-buffer)
     (process-send-string nil (concat (json-encode data) "\n"))
     (while (not (search-forward "\n" nil t))

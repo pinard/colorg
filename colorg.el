@@ -71,9 +71,6 @@ Both are needed: as each server uses it own numbering, numbers may clash.
 This COLORG-DATA structure replaces buffer-local variables which would be
 more attractive, if only major modes did not tamper with them unexpectedly.")
 
-(defvar colorg-my-login-number nil
-  "The login number for the local user in this buffer.")
-
 (define-minor-mode colorg-mode
   "Collaborative editing mode.
 See https://github.com/pinard/colorg/wiki/ for more information."
@@ -81,22 +78,19 @@ See https://github.com/pinard/colorg/wiki/ for more information."
   (if colorg-mode
       (condition-case err
           (let ((server (colorg-select-server)))
-            (save-excursion
-              (set-buffer server)
-              (setq colorg-my-login-number co-user))
             (push (list (current-buffer) (colorg-associate-resource) server)
                   colorg-data))
         (error (let ((data (assq (current-buffer) colorg-data)))
                  (when data
-                   (colorg-ask-server (list 'leave (nth 1 data)))))
+                   (colorg-ask-server (list 'leave (nth 1 data)))
+                   (setq colorg-data (delq data colorg-data))))
                (setq colorg-mode nil)
-               (error "Error in colorg activation: %s"
+               (error "Error activating colorg: %s"
                       (error-message-string err))))
     (let ((data (assq (current-buffer) colorg-data)))
       (when data
-        (colorg-ask-server (list 'leave (nth 1 data)))))
-    (setq colorg-data (delq (assq (current-buffer) colorg-data)
-                            colorg-data))))
+        (colorg-ask-server (list 'leave (nth 1 data)))
+        (setq colorg-data (delq data colorg-data))))))
 
 (defun colorg-global-enable ()
   (interactive)

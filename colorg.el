@@ -118,7 +118,7 @@ create a new resource and upload its contents from the buffer."
   (let* ((pairs (colorg-ask-server 'resources))
          (name (and pairs
                     (completing-read "Existing resource? " pairs nil t)))
-         resource)
+         resource string start)
     (if (and name (not (string-equal name "")))
         (let ((md5sum
                (let ((output (generate-new-buffer " *md5sum*")))
@@ -136,10 +136,12 @@ create a new resource and upload its contents from the buffer."
       (setq name (read-string "New resource name? " nil nil (buffer-name)))
       (when (assoc name pairs)
         (error "This resource already exists."))
-      (setq resource (car (colorg-ask-server (list 'create name))))
-      (push (list 'alter resource (point-min) (point-min)
-                  (buffer-substring-no-properties (point-min) (point-max)))
-            colorg-outgoing-list))
+      (setq resource (car (colorg-ask-server (list 'create name)))
+            string (buffer-substring-no-properties (point-min) (point-max))
+            start (point-min))
+      (save-excursion
+        (set-buffer colorg-buffer)
+        (push (list 'alter resource start start string) co-outgoing)))
     resource))
 
 (defun colorg-select-resource ()
@@ -223,27 +225,30 @@ These commands are accumulated and sent at regular intervals."
   (when colorg-mode
     ;; Combine a pure insert with a previous alter, whenever possible.
     (let* ((data (assq (current-buffer) colorg-data))
+           (string (buffer-substring-no-properties start end))
            (resource (cadr data))
-           (server (caddr data))
-           (info (and colorg-outgoing-list
-                      (zerop deleted)
-                      (eq (caar colorg-outgoing-list) 'alter)
-                      (= (cadar colorg-outgoing-list) resource)
-                      (cddar colorg-outgoing-list))))
-      (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
-          (setcar (cddr info)
-                  (concat (caddr info)
-                             (buffer-substring-no-properties start end)))
-        (push (list 'alter resource (1- start) (+ (1- start) deleted)
-                    (buffer-substring-no-properties start end))
-              colorg-outgoing-list)))))
+           (server (caddr data)))
+      (save-excursion
+        (set-buffer colorg-buffer)
+        (let ((info (and co-outgoing
+                         (zerop deleted)
+                         (eq (caar co-outgoing) 'alter)
+                         (= (cadar co-outgoing) resource)
+                         (cddar co-outgoing))))
+          (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
+              (setcar (cddr info) (concat (caddr info) string))
+            (push (list 'alter resource (1- start) (+ (1- start) deleted) string)
+                  co-outgoing)))))))
 
 (defun colorg-idle-routine ()
   "Whenever Emacs gets idle, round-trip with the synchronization server.
 We push out accumulated commands.  Then, we get externally
 triggered alter commands from the server and execute them all."
-  (let ((outgoing colorg-outgoing-list))
-    (setq colorg-outgoing-list nil)
+  (let (outgoing)
+    (save-excursion
+      (set-buffer colorg-buffer)
+      (setq outgoing co-outgoing)
+      (setq co-outgoing nil))
     (let ((values
            (save-match-data
              (colorg-ask-server (if outgoing
@@ -260,14 +265,11 @@ triggered alter commands from the server and execute them all."
 (defvar colorg-idle-timer nil
   "Timer used to detect the quiescence of Emacs.")
 
-(defvar colorg-outgoing-list nil
-  "Accumulated alter commands meant to be broadcasted.
-This is a reversed list, the most recent command appears first.
-These are sent to the server whenever Emacs gets idle for a jiffie.")
+;;(defvar colorg-outgoing-list nil
+;;  "Accumulated alter commands meant to be broadcasted.
+;;This is a reversed list, the most recent command appears first.
+;;These are sent to the server whenever Emacs gets idle for a jiffie.")
 
-;; FIXME: Should have one such buffer per server.
-(defvar colorg-buffer-name "*colorg*")
-(defvar colorg-process nil)
 (defvar colorg-buffer nil)
 
 (require 'json)
@@ -298,8 +300,7 @@ If the server does not exist yet, create it."
             (set (make-local-variable 'co-process)
                  (open-network-stream name buffer host port))
             (set-process-query-on-exit-flag co-process nil)
-            (setq colorg-buffer buffer
-                  colorg-process co-process)
+            (setq colorg-buffer buffer)
             (set (make-local-variable 'co-alist) nil)
             (set (make-local-variable 'co-outgoing) nil)
             (set (make-local-variable 'co-user)
@@ -317,7 +318,7 @@ If the server does not exist yet, create it."
     (while (not (search-forward "\n" nil t))
       (goto-char (point-max))
       (let ((here (point)))
-        (accept-process-output colorg-process colorg-accept-timeout)
+        (accept-process-output co-process colorg-accept-timeout)
         (when (= here (point-max))
           (colorg-mode 0)
           (error "colorg disabled: server does not seem to reply.")))

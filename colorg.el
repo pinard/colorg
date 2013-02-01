@@ -76,20 +76,19 @@ more attractive, if only major modes did not tamper with them unexpectedly.")
 See https://github.com/pinard/colorg/wiki/ for more information."
   nil " co" nil
   (if colorg-mode
-      (condition-case err
-          (let ((server (colorg-select-server)))
-            (push (list (current-buffer) (colorg-associate-resource) server)
-                  colorg-data))
-        (error (let ((data (assq (current-buffer) colorg-data)))
-                 (when data
-                   (colorg-ask-server (list 'leave (nth 1 data)))
-                   (setq colorg-data (delq data colorg-data))))
-               (setq colorg-mode nil)
-               (error "Error activating colorg: %s"
-                      (error-message-string err))))
+      ;; Turning mode on.
+      (let (server resource)
+        (condition-case err
+            (setq server (colorg-select-server)
+                  resource (colorg-associate-resource server))
+          (error (setq colorg-mode nil)
+                 (error "Error activating colorg: %s"
+                        (error-message-string err))))
+        (push (list (current-buffer) resource server) colorg-data))
+    ;; Turning mode off.
     (let ((data (assq (current-buffer) colorg-data)))
       (when data
-        (colorg-ask-server (list 'leave (nth 1 data)))
+        (colorg-round-trip (list 'leave (nth 1 data)) (nth 2 data))
         (setq colorg-data (delq data colorg-data))))))
 
 (defun colorg-global-enable ()
@@ -109,13 +108,13 @@ See https://github.com/pinard/colorg/wiki/ for more information."
 
 ;;; Command processing.
 
-(defun colorg-associate-resource ()
-  "Select a resource interactively, then return its number.
+(defun colorg-associate-resource (server)
+  "Select one of SERVER's resource interactively and return its number.
 If the resource already exists, associate the current buffer with
 the resource if the contents match.  If they do not match and the
 buffer is empty, download the resource in the buffer.  Otherwise,
 create a new resource and upload its contents from the buffer."
-  (let* ((pairs (colorg-ask-server 'resources))
+  (let* ((pairs (colorg-round-trip 'resources server))
          (name (and pairs
                     (completing-read "Existing resource? " pairs nil t)))
          resource string start)
@@ -132,27 +131,28 @@ create a new resource and upload its contents from the buffer."
                          (skip-chars-backward "- \n")
                          (buffer-substring-no-properties (point-min) (point))))
                    (kill-buffer output)))))
-          (setq resource (car (colorg-ask-server (list 'join name md5sum)))))
+          (setq resource
+                (car (colorg-round-trip (list 'join name md5sum) server))))
       (setq name (read-string "New resource name? " nil nil (buffer-name)))
       (when (assoc name pairs)
         (error "This resource already exists."))
-      (setq resource (car (colorg-ask-server (list 'create name)))
+      (setq resource (car (colorg-round-trip (list 'create name) server))
             string (buffer-substring-no-properties (point-min) (point-max))
             start (point-min))
       (save-excursion
-        (set-buffer colorg-buffer)
+        (set-buffer server)
         (push (list 'alter resource start start string) co-outgoing)))
     resource))
 
-(defun colorg-select-resource ()
-  "Select a resource interactively, return its number, else nil."
-  (let* ((pairs (colorg-ask-server 'resources))
+(defun colorg-select-resource (server)
+  "Select a SERVER resource interactively, return its number, else nil."
+  (let* ((pairs (colorg-round-trip 'resources server))
          (name (completing-read "Which resource? " pairs nil t)))
     (and name (cadr (assoc name pairs)))))
 
-(defun colorg-select-user ()
-  "Select a user interactively, return its number, else nil."
-  (let* ((pairs (colorg-ask-server 'users))
+(defun colorg-select-user (server)
+  "Select a SERVER user interactively, return its number, else nil."
+  (let* ((pairs (colorg-round-trip 'users server))
          (name (completing-read "Which user? " pairs nil t)))
     (and name (cadr (assoc name pairs)))))
 
@@ -160,10 +160,132 @@ create a new resource and upload its contents from the buffer."
   (interactive)
   ;; FIXME: implement!
   )
+
+;;; Hooks monitoring user actions.
 
-(defun colorg-ask-server (command)
-  "Send COMMAND to server, receive and process reply, then return values."
-  (colorg-reply-handler (colorg-round-trip command)))
+(defun colorg-after-change-routine (start end deleted)
+  "After any buffer change, tell the server about the alter to do.
+These commands are accumulated and sent at regular intervals."
+  (when colorg-mode
+    ;; Combine a pure insert with a previous alter, whenever possible.
+    (let* ((string (buffer-substring-no-properties start end))
+           (data (assq (current-buffer) colorg-data))
+           (resource (nth 1 data))
+           (server (nth 2 data)))
+      (save-excursion
+        (set-buffer server)
+        (let ((info (and co-outgoing
+                         (zerop deleted)
+                         (eq (caar co-outgoing) 'alter)
+                         (= (cadar co-outgoing) resource)
+                         (cddar co-outgoing))))
+          (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
+              (setcar (cddr info) (concat (caddr info) string))
+            (push (list 'alter resource (1- start) (+ (1- start) deleted) string)
+                  co-outgoing)))))))
+
+(defun colorg-idle-routine ()
+  "Whenever Emacs gets idle, round trip with the synchronization server.
+We push out accumulated commands.  Then, we get externally
+triggered alter commands from the server and execute them all."
+  (save-match-data
+    (let ((pairs colorg-server-buffers))
+      (while pairs
+        (let ((server (cdr (pop pairs)))
+              outgoing)
+          (save-excursion
+            (set-buffer server)
+            (setq outgoing co-outgoing)
+            (setq co-outgoing nil))
+          ;; Once incoming dispatch works, move this in the save-excursion.
+          (colorg-round-trip (if outgoing
+                                 (cons 'poll (nreverse outgoing))
+                               'poll)
+                             server))))))
+;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
+
+;;; Servers and communication.
+
+(defvar colorg-server-buffers nil
+  "Association list relating server names to server buffers.")
+
+(defvar colorg-idle-timer nil
+  "Timer used to detect the quiescence of Emacs.")
+
+(require 'json)
+
+(defun colorg-select-server ()
+  "Select a server interactively, and return its buffer.
+If the server does not exist yet, create it."
+  (let* ((name (completing-read "Which server? " colorg-server-buffers))
+         (pair (assoc name colorg-server-buffers)))
+    (unless pair
+      (when (string-equal name "")
+        (cond ((not colorg-server-buffers)
+               (setq name "local"))
+              ((= (length colorg-server-buffers) 1)
+               (setq pair (car colorg-server-buffers)
+                     name (car pair)))
+              (t (error "Many servers, please select one."))))
+      (unless pair
+        (let ((host (read-string (format "Server %s host? " name)
+                                 "localhost"))
+              (port (string-to-number
+                     (read-string (format "Server %s port? " name)
+                                  "7997")))
+              (server (get-buffer-create (format " *colorg %s*" name))))
+          (save-excursion
+            (set-buffer server)
+
+            ;; Server nickname, for diagnostic purposes.
+            (set (make-local-variable 'co-name) name)
+
+            ;; Network stream reaching the colorg server.
+            (set (make-local-variable 'co-process)
+                 (open-network-stream name server host port))
+            (set-process-query-on-exit-flag co-process nil)
+
+            ;; Association list relating a resource number to a local
+            ;; buffer in colorg mode.
+            (set (make-local-variable 'co-alist) nil)
+
+            ;; Alter commands meant to be broadcasted as a reversed
+            ;; list: the most recently accumulated command first.
+            ;; These are sent to the server at regular time intervals.
+            (set (make-local-variable 'co-outgoing) nil)
+
+            ;; Our own user number on this server.
+            (set (make-local-variable 'co-user)
+                 (car (colorg-round-trip (list 'login colorg-user-nickname)
+                                         server))))
+
+          ;; Register this server buffer.
+          (setq pair (cons name server))
+          (push pair colorg-server-buffers))))
+    (cdr pair)))
+
+(defun colorg-round-trip (command server)
+  "Send COMMAND to SERVER, receive and process reply, then return values."
+  (colorg-reply-handler
+   (save-excursion
+     (set-buffer server)
+     (unless (and (processp co-process)
+                  ;; FIXME: Because I restart the server?  Not healthy!
+                  (eq (process-status co-process) 'open))
+       (error "Server %s process vanished." co-name))
+     (erase-buffer)
+     (process-send-string nil (concat (json-encode command) "\n"))
+     (while (not (search-forward "\n" nil t))
+       (goto-char (point-max))
+       (let ((here (point)))
+         (accept-process-output co-process colorg-accept-timeout)
+         (when (= here (point-max))
+           (colorg-mode 0)
+           (error "colorg disabled: server does not seem to reply.")))
+       (goto-char (point-min)))
+     (goto-char (point-min))
+     (let ((json-array-type 'list))
+       (json-read)))))
 
 (defun colorg-reply-handler (command)
   "Process COMMAND as received from the colorg server, then return values."
@@ -216,118 +338,6 @@ create a new resource and upload its contents from the buffer."
                string))))
           (t (debug)))
     values))
-
-;;; Hooks monitoring user actions.
-
-(defun colorg-after-change-routine (start end deleted)
-  "After any buffer change, tell the server about the alter to do.
-These commands are accumulated and sent at regular intervals."
-  (when colorg-mode
-    ;; Combine a pure insert with a previous alter, whenever possible.
-    (let* ((data (assq (current-buffer) colorg-data))
-           (string (buffer-substring-no-properties start end))
-           (resource (cadr data))
-           (server (caddr data)))
-      (save-excursion
-        (set-buffer colorg-buffer)
-        (let ((info (and co-outgoing
-                         (zerop deleted)
-                         (eq (caar co-outgoing) 'alter)
-                         (= (cadar co-outgoing) resource)
-                         (cddar co-outgoing))))
-          (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
-              (setcar (cddr info) (concat (caddr info) string))
-            (push (list 'alter resource (1- start) (+ (1- start) deleted) string)
-                  co-outgoing)))))))
-
-(defun colorg-idle-routine ()
-  "Whenever Emacs gets idle, round-trip with the synchronization server.
-We push out accumulated commands.  Then, we get externally
-triggered alter commands from the server and execute them all."
-  (save-match-data
-    (let (outgoing)
-      (save-excursion
-        (set-buffer colorg-buffer)
-        (setq outgoing co-outgoing)
-        (setq co-outgoing nil))
-      (colorg-ask-server (if outgoing
-                             (cons 'poll (nreverse outgoing))
-                           'poll)))))
-;;(timer-set-idle-time colorg-idle-timer colorg-idle-timeout)
-
-;;; Servers and communication.
-
-(defvar colorg-server-buffers nil
-  "Association list relating server names to server buffers.")
-
-(defvar colorg-idle-timer nil
-  "Timer used to detect the quiescence of Emacs.")
-
-;; Local variables to server buffers:
-
-;;(defvar co-outgoing nil
-;;  "Accumulated alter commands meant to be broadcasted.
-;;This is a reversed list, the most recent command appears first.
-;;These are sent to the server whenever Emacs gets idle for a jiffie.")
-
-(require 'json)
-
-(defun colorg-select-server ()
-  "Select a server interactively, and return its buffer.
-If the server does not exist yet, create it."
-  (let* ((name (completing-read "Which server? " colorg-server-buffers))
-         (pair (assoc name colorg-server-buffers)))
-    (unless pair
-      (when (string-equal name "")
-        (cond ((not colorg-server-buffers)
-               (setq name "local"))
-              ((= (length colorg-server-buffers) 1)
-               (setq pair (car colorg-server-buffers)
-                     name (car pair)))
-              (t (error "Many servers, please select one."))))
-      (unless pair
-        (let ((host (read-string (format "Server %s host? " name)
-                                 "localhost"))
-              (port (string-to-number
-                     (read-string (format "Server %s port? " name)
-                                  "7997")))
-              (buffer (get-buffer-create (format " *colorg %s*" name))))
-          (save-excursion
-            (set-buffer buffer)
-            (set (make-local-variable 'co-name) name)
-            (set (make-local-variable 'co-process)
-                 (open-network-stream name buffer host port))
-            (set-process-query-on-exit-flag co-process nil)
-            (setq colorg-buffer buffer)
-            (set (make-local-variable 'co-alist) nil)
-            (set (make-local-variable 'co-outgoing) nil)
-            (set (make-local-variable 'co-user)
-                 (car (colorg-ask-server
-                       (list 'login colorg-user-nickname)))))
-          (setq pair (cons name buffer))
-          (push pair colorg-server-buffers))))
-    (cdr pair)))
-
-(defun colorg-round-trip (data)
-  (save-excursion
-    (set-buffer colorg-buffer)
-      (unless (and (processp co-process)
-                   ;; FIXME: Because I restart the server?  Not healthy!
-                   (eq (process-status co-process) 'open))
-        (error "Server %s process vanished." co-name))
-    (erase-buffer)
-    (process-send-string nil (concat (json-encode data) "\n"))
-    (while (not (search-forward "\n" nil t))
-      (goto-char (point-max))
-      (let ((here (point)))
-        (accept-process-output co-process colorg-accept-timeout)
-        (when (= here (point-max))
-          (colorg-mode 0)
-          (error "colorg disabled: server does not seem to reply.")))
-      (goto-char (point-min)))
-    (goto-char (point-min))
-    (let ((json-array-type 'list))
-      (json-read))))
 
 ;;; Coloration matters.
 

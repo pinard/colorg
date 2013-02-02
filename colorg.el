@@ -64,11 +64,11 @@ The special value 'org rather requests Org notifications.")
 
 ;;; Activation and deactivation.
 
-(defvar colorg-data nil
+(defvar colorg-buffer-alist nil
   "List of (BUFFER RESOURCE SERVER) triplets.
 A monitored BUFFER is associated to a RESOURCE number and a SERVER connection.
-Both are needed: as each server uses it own numbering, numbers may clash.
-This COLORG-DATA structure replaces buffer-local variables which would be
+Both are needed: as each server uses it own numbering, numbers may clash.  This
+COLORG-BUFFER-ALIST structure replaces buffer-local variables which would be
 more attractive, if only major modes did not tamper with them unexpectedly.")
 
 (define-minor-mode colorg-mode
@@ -77,19 +77,29 @@ See https://github.com/pinard/colorg/wiki/ for more information."
   nil " co" nil
   (if colorg-mode
       ;; Turning mode on.
-      (let (server resource)
+      (let ((buffer (current-buffer))
+            server resource)
         (condition-case err
             (setq server (colorg-select-server)
                   resource (colorg-associate-resource server))
           (error (setq colorg-mode nil)
                  (error "Error activating colorg: %s"
                         (error-message-string err))))
-        (push (list (current-buffer) resource server) colorg-data))
+        (push (list (current-buffer) resource server) colorg-buffer-alist)
+        (save-excursion
+          (set-buffer server)
+          (push (cons resource buffer) co-alist)))
     ;; Turning mode off.
-    (let ((data (assq (current-buffer) colorg-data)))
+    (let* ((buffer (current-buffer))
+           (data (assq buffer colorg-buffer-alist))
+           (resource (nth 1 data))
+           (server (nth 2 data)))
       (when data
-        (colorg-round-trip (list 'leave (nth 1 data)) (nth 2 data))
-        (setq colorg-data (delq data colorg-data))))))
+        (colorg-round-trip (list 'leave resource) server)
+        (save-excursion
+          (set-buffer server)
+          (setq co-alist (delq (assq resource co-alist))))
+        (setq colorg-buffer-alist (delq data colorg-buffer-alist))))))
 
 (defun colorg-global-enable ()
   (interactive)
@@ -105,6 +115,13 @@ See https://github.com/pinard/colorg/wiki/ for more information."
   (cancel-timer colorg-idle-timer))
 
 (colorg-global-enable)
+
+(defun colorg-kill-buffer-routine ()
+  "Unregister from the server when killing a buffer in colorg mode."
+  (when colorg-mode
+    (colorg-mode 0)))
+
+(add-hook 'kill-buffer-hook 'colorg-kill-buffer-routine)
 
 ;;; Command processing.
 
@@ -137,7 +154,7 @@ create a new resource and upload its contents from the buffer."
       (when (assoc name pairs)
         (error "This resource already exists."))
       (setq resource (car (colorg-round-trip (list 'create name) server))
-            string (buffer-substring-no-properties (point-min) (point-max))
+            string (buffer-substring-no-properties (point-min) (point-max))     
             start (point-min))
       (save-excursion
         (set-buffer server)
@@ -169,7 +186,7 @@ These commands are accumulated and sent at regular intervals."
   (when colorg-mode
     ;; Combine a pure insert with a previous alter, whenever possible.
     (let* ((string (buffer-substring-no-properties start end))
-           (data (assq (current-buffer) colorg-data))
+           (data (assq (current-buffer) colorg-buffer-alist))
            (resource (nth 1 data))
            (server (nth 2 data)))
       (save-excursion
@@ -266,29 +283,28 @@ If the server does not exist yet, create it."
 
 (defun colorg-round-trip (command server)
   "Send COMMAND to SERVER, receive and process reply, then return values."
-  (colorg-reply-handler
-   (save-excursion
-     (set-buffer server)
-     (unless (and (processp co-process)
-                  ;; FIXME: Because I restart the server?  Not healthy!
-                  (eq (process-status co-process) 'open))
-       (error "Server %s process vanished." co-name))
-     (erase-buffer)
-     (process-send-string nil (concat (json-encode command) "\n"))
-     (while (not (search-forward "\n" nil t))
-       (goto-char (point-max))
-       (let ((here (point)))
-         (accept-process-output co-process colorg-accept-timeout)
-         (when (= here (point-max))
-           (colorg-mode 0)
-           (error "colorg disabled: server does not seem to reply.")))
-       (goto-char (point-min)))
-     (goto-char (point-min))
-     (let ((json-array-type 'list))
-       (json-read)))))
+  (save-excursion
+    (set-buffer server)
+    (unless (and (processp co-process)
+                 ;; FIXME: Because I restart the server?  Not healthy!
+                 (eq (process-status co-process) 'open))
+      (error "Server %s process vanished." co-name))
+    (erase-buffer)
+    (process-send-string nil (concat (json-encode command) "\n"))
+    (while (not (search-forward "\n" nil t))
+      (goto-char (point-max))
+      (let ((here (point)))
+        (accept-process-output co-process colorg-accept-timeout)
+        (when (= here (point-max))
+          (colorg-mode 0)
+          (error "colorg disabled: server does not seem to reply.")))
+      (goto-char (point-min)))
+    (goto-char (point-min))
+    (colorg-reply-handler (let ((json-array-type 'list))
+                            (json-read)))))
 
 (defun colorg-reply-handler (command)
-  "Process COMMAND as received from the colorg server, then return values."
+  "Process COMMAND, then return values.  The server buffer should be current."
   (let (action arguments values)
     (if (stringp command)
         (setq action (intern command)
@@ -303,14 +319,18 @@ If the server does not exist yet, create it."
                  (end (1+ (nth 2 arguments)))
                  (string (nth 3 arguments))
                  (user (nth 4 arguments)))
-             (save-excursion
-               ;; FIXME: Switch to the proper resource.
-               (delete-region start end)
-               (goto-char start)
-               (when (numberp string)
-                 (setq string (make-string string '?')))
-               (insert-before-markers string)
-               (colorg-colorize start (+ start (length string)) user))))
+             (let ((buffer (cdr (assq resource co-alist))))
+               (if buffer
+                   (save-excursion
+                     (set-buffer buffer)
+                     (delete-region start end)
+                     (goto-char start)
+                     (when (numberp string)
+                       (setq string (make-string string '?')))
+                     (insert-before-markers string)
+                     (colorg-colorize start (+ start (length string)) user))
+                 (message "colorg-reply-handler: No local buffer to handle %S"
+                          command)))))
           ((eq action 'chat)
            (let ((user (nth 0 arguments))
                  (string (nth 1 arguments)))
@@ -348,12 +368,12 @@ If the server does not exist yet, create it."
   "Association between keys and overlays.")
 
 (defun colorg-colorize (start end key)
-  "Highlight region from START to END with a color tied to KEY.
+  "Highlight current buffer region from START to END with a color tied to KEY.
 The first time an key appears, automatically select a color for it.
 Else, first remove the previous highlight made for that key."
   (let ((pair (assoc key colorg-overlays)))
     (if pair
-        (move-overlay (cdr pair) start end)
+        (move-overlay (cdr pair) start end (current-buffer))
       (let ((overlay (make-overlay start end)))
         (overlay-put overlay 'face (colorg-face-name key))
         (push (cons key overlay) colorg-overlays)))))

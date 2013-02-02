@@ -24,21 +24,21 @@
 
 ;;; Commentary:
 
-;; colorg is a real-time collaborative editing tool meant for Emacs
-;; Org mode users.  See https://github.com/pinard/colorg/wiki/.
-
-;; At this stage, the tool is aiming simplicity: the idea is to
-;; quickly get a working prototype.  All collaborating users are
-;; connected to a common server, communications do not try to be fully
-;; asynchronous, so users might experience delays.  Further
-;; experimentation, tuning and development may follow.
+;; colorg is a real-time collaborative editing tool originally meant
+;; for Emacs Org mode, but usable more generally.  It requires a
+;; running colorg server.  See https://github.com/pinard/colorg/wiki/.
 
 ;;; Code:
 
 ;; The code is organized into pages, grouping declarations by topic.
 ;; Such pages are introduced by a form feed and a topic description.
+;; Variables START and END refer to Emacs positions, which are one-based.
+;; If ever needed, use FIRST for colorg positions, which are zero-based.
 
 ;;; User parameterization.
+
+(defconst colorg-welcome "colorg v1"
+  "Welcome string expected when initially contacting a colorg server.")
 
 (defvar colorg-user-nickname (user-login-name)
   "Name by which this user is identified to other collaborators.")
@@ -154,11 +154,11 @@ create a new resource and upload its contents from the buffer."
       (when (assoc name pairs)
         (error "This resource already exists."))
       (setq resource (car (colorg-round-trip (list 'create name) server))
-            string (buffer-substring-no-properties (point-min) (point-max))     
+            insert (buffer-substring-no-properties (point-min) (point-max))
             start (point-min))
       (save-excursion
         (set-buffer server)
-        (push (list 'alter resource start start string) co-outgoing)))
+        (push (list 'alter resource (1- start) 0 insert) co-outgoing)))
     resource))
 
 (defun colorg-select-resource (server)
@@ -184,22 +184,14 @@ create a new resource and upload its contents from the buffer."
   "After any buffer change, tell the server about the alter to do.
 These commands are accumulated and sent at regular intervals."
   (when colorg-mode
-    ;; Combine a pure insert with a previous alter, whenever possible.
-    (let* ((string (buffer-substring-no-properties start end))
+    (let* ((insert (buffer-substring-no-properties start end))
            (data (assq (current-buffer) colorg-buffer-alist))
            (resource (nth 1 data))
            (server (nth 2 data)))
       (save-excursion
         (set-buffer server)
-        (let ((info (and co-outgoing
-                         (zerop deleted)
-                         (eq (caar co-outgoing) 'alter)
-                         (= (cadar co-outgoing) resource)
-                         (cddar co-outgoing))))
-          (if (and info (= (1- start) (+ (car info) (length (caddr info)))))
-              (setcar (cddr info) (concat (caddr info) string))
-            (push (list 'alter resource (1- start) (+ (1- start) deleted) string)
-                  co-outgoing)))))))
+        (push (list 'alter resource (1- start) deleted insert)
+              co-outgoing)))))
 
 (defun colorg-idle-routine ()
   "Whenever Emacs gets idle, round trip with the synchronization server.
@@ -262,6 +254,23 @@ If the server does not exist yet, create it."
                  (open-network-stream name server host port))
             (set-process-query-on-exit-flag co-process nil)
 
+            ;; Make sure the server replies correctly.
+            (erase-buffer)
+            (while (not (search-forward "\n" nil t))
+              (goto-char (point-max))
+              (let ((here (point)))
+                (accept-process-output co-process colorg-accept-timeout)
+                (when (= here (point-max))
+                  (colorg-mode 0)
+                  (error "colorg disabled: server does not seem to reply.")))
+              (goto-char (point-min)))
+            (goto-char (point-min))
+            (let* ((json-array-type 'list)
+                   (reply (json-read)))
+              (unless (string-equal reply colorg-welcome)
+                (error "colorg disabled: server sent %S instead of %S"
+                       reply colorg-welcome)))
+
             ;; Association list relating a resource number to a local
             ;; buffer in colorg mode.
             (set (make-local-variable 'co-alist) nil)
@@ -316,19 +325,19 @@ If the server does not exist yet, create it."
                  (inhibit-point-motion-hooks t)
                  (resource (nth 0 arguments))
                  (start (1+ (nth 1 arguments)))
-                 (end (1+ (nth 2 arguments)))
-                 (string (nth 3 arguments))
+                 (deleted (nth 2 arguments))
+                 (insert (nth 3 arguments))
                  (user (nth 4 arguments)))
              (let ((buffer (cdr (assq resource co-alist))))
                (if buffer
                    (save-excursion
                      (set-buffer buffer)
-                     (delete-region start end)
+                     (delete-region start (+ start deleted))
                      (goto-char start)
-                     (when (numberp string)
-                       (setq string (make-string string '?')))
-                     (insert-before-markers string)
-                     (colorg-colorize start (+ start (length string)) user))
+                     (when (numberp insert)
+                       (setq insert (make-string insert '?')))
+                     (insert-before-markers insert)
+                     (colorg-colorize start (+ start (length insert)) user))
                  (message "colorg-reply-handler: No local buffer to handle %S"
                           command)))))
           ((eq action 'chat)
@@ -369,8 +378,13 @@ If the server does not exist yet, create it."
 
 (defun colorg-colorize (start end key)
   "Highlight current buffer region from START to END with a color tied to KEY.
-The first time an key appears, automatically select a color for it.
+If the region is empty, extend it so it contains one character.
+The first time a key appears, automatically select a color for it.
 Else, first remove the previous highlight made for that key."
+  (unless (< start end)
+    (cond ((> start (point-min)) (setq end start
+                                       start (1- start)))
+          ((< start (point-max)) (setq end (1+ start)))))
   (let ((pair (assoc key colorg-overlays)))
     (if pair
         (move-overlay (cdr pair) start end (current-buffer))

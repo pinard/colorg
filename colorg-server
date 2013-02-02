@@ -43,6 +43,7 @@ import json
 import sys
 
 
+welcome = 'colorg v1'
 encoding = 'UTF-8'
 md5_empty = 'd41d8cd98f00b204e9800998ecf8427e'
 
@@ -115,9 +116,10 @@ class Client(gevent.Greenlet):
         self.host = host
         self.port = port
         self.report("%r Incoming connection.", self)
-        # User commands waiting to be processed on the server.
-        self.incoming_queue = []
-        # Server commands waiting to be polled and read by the client.
+        text = '"%s"' % welcome
+        if run.debug:
+            self.report("%s %s", ' ' * len(repr(self)), text)
+        self.output.write(text + '\n')
         self.outgoing_queue = []
 
     def __repr__(self):
@@ -175,20 +177,20 @@ class Client(gevent.Greenlet):
         except TypeError, exception:
             raise Warn(str(exception))
 
-    def do_alter(self, resource, start, end, string):
+    def do_alter(self, resource, first, deleted, insert):
         resource = self.resolve_resource(resource)
         if self not in resource.users:
             raise Error("Resource not monitored: %r" % resource)
-        resource.alter(start, end, string)
+        resource.alter(first, deleted, insert)
         for client in resource.users:
             client.outgoing_queue.append(
-                ('alter', resource.ordinal, start, end, string,
+                ('alter', resource.ordinal, first, deleted, insert,
                  self.user.ordinal))
         return 'done'
 
-    def do_chat(self, user, string):
+    def do_chat(self, user, insert):
         user = self.resolve_user(user)
-        user.outgoing_queue.append(['chat', self.user.ordinal, string])
+        user.outgoing_queue.append(['chat', self.user.ordinal, insert])
         return 'done'
 
     def do_create(self, name):
@@ -237,39 +239,36 @@ class Client(gevent.Greenlet):
     def do_resources(self):
         return ['done'] + [
             [resource.name, key]
-             for key, resource in sorted(Resource.registry.items())]
+            for key, resource in sorted(Resource.registry.items())]
 
     def do_poll(self, *subcommands):
         undos = []
         redos = []
         for command in subcommands:
             if command[0] == 'alter':
-                _, resource, start, end, string = command
-                after = start + len(string)
-                undos.append(['alter', resource, start, start + len(string),
-                              end - start, self.user.ordinal])
+                _, resource, first, deleted, insert = command
+                after = first + len(insert)
+                undos.append(['alter', resource, first, len(insert),
+                              deleted, self.user.ordinal])
                 for command_0 in self.outgoing_queue:
                     if command_0[0] == 'alter' and command_0[1] == resource:
                         # COMMAND_0 should have been done first: so fine tune
                         # COMMAND to account for this chronological error.
-                        _, _, start_0, end_0, string_0, _ = command_0
+                        _, _, first_0, end_0, insert_0, _ = command_0
                         # Nothing to do when COMMAND_0 appears textually
                         # later in the buffer.
-                        if after > start_0:
-                            after_0 = start_0 + len(string_0)
-                            if start > after_0:
+                        if after > first_0:
+                            after_0 = first_0 + len(insert_0)
+                            if first > after_0:
                                 # Merely shift if COMMAND_0 appears sooner.
                                 delta = after_0 - end_0
-                                start += delta
-                                end += delta
+                                first += delta
                             else:
                                 # There is a clash.  Delete characters no more
                                 # than once and make sure to keep both inserts.
                                 # FIXME:
                                 pass
-                redos.append(['alter', resource, start, end, string])
-            else:
-                raise Error("Expecting an alter command: %r" % command)
+                redos.append(['alter', resource, first, deleted, insert])
         for command in redos:
             self.dispatch(command)
         undos.reverse()
@@ -282,7 +281,7 @@ class Client(gevent.Greenlet):
     def do_users(self):
         return ['done'] + [
             [client.name, key]
-             for key, client in sorted(User.registry.items())]
+            for key, client in sorted(User.registry.items())]
 
     def report(self, format, *arguments):
         now = datetime.datetime.now().time()
@@ -317,8 +316,10 @@ class Resource:
     def __repr__(self):
         return repr(self.name)
 
-    def alter(self, start, end, string):
-        self.contents = self.contents[:start] + string + self.contents[end:]
+    def alter(self, first, deleted, insert):
+        self.contents = (self.contents[:first]
+                         + insert
+                         + self.contents[first + deleted:])
 
     @staticmethod
     def get(name):

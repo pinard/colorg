@@ -98,7 +98,7 @@ See https://github.com/pinard/colorg/wiki/ for more information."
         (colorg-round-trip (list 'leave resource) server)
         (save-excursion
           (set-buffer server)
-          (setq co-alist (delq (assq resource co-alist))))
+          (setq co-alist (delq (assq resource co-alist) co-alist)))
         (setq colorg-buffer-alist (delq data colorg-buffer-alist))))))
 
 (defun colorg-global-enable ()
@@ -174,9 +174,16 @@ create a new resource and upload its contents from the buffer."
     (and name (cadr (assoc name pairs)))))
 
 (defun colorg-send-message (text)
-  (interactive)
-  ;; FIXME: implement!
-  )
+  "Send some chat TEXT to some interactively selected user.
+The current buffer's colorg server is queried for possible users."
+  (interactive "sMessage? ")
+  (let* ((buffer (current-buffer))
+         (data (assq buffer colorg-buffer-alist))
+         (server (nth 2 data)))
+    (unless server
+      (error "No server found for this buffer"))
+    (colorg-round-trip (list 'chat (colorg-select-user server) text)
+                       server)))
 
 ;;; Hooks monitoring user actions.
 

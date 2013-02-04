@@ -46,6 +46,7 @@ import sys
 welcome = 'colorg v1'
 encoding = 'UTF-8'
 md5_empty = 'd41d8cd98f00b204e9800998ecf8427e'
+localhost = '127.0.0.1'
 
 
 class Error(Exception):
@@ -91,7 +92,7 @@ class Main:
             sys.stderr.write('\n')
 
     def listener(self):
-        "To each new connection, assign a User."
+        "For each new connection, create a Client task to handle it."
         handle = socket.socket()
         handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         handle.bind((self.host, self.port))
@@ -106,11 +107,77 @@ class Main:
         sys.stderr.write('%s\n' % (format % arguments).rstrip())
 
 
+class Canonical(list):
+    """\
+A Canonical is a sequence of [FIRST, DELETED, INSERT, USER] lists, for
+which all lists describe independant changes: there is no kind of
+overlap between them.  Moreover, inserts are concatenated when feasible.
+No two lists in a canonical sequence share the same FIRST field, and
+these are kept in increasing order within the sequence.
+"""
+
+    def add_straight(self, first2, deleted2, insert2, user2):
+        """\
+Add a triplet to a Canonical, with strict obedience in case of clashes.
+This is for modification sets all originating from the same user.
+"""
+        # Find INDEX where the new modification should be added or merged.
+        delta2 = len(insert2) - deleted2
+        index = len(self)
+        while index > 0 and first2 < self[index - 1][0]:
+            index -= 1
+            self[index][0] += delta2
+            first2 -= len(self[index][2]) - self[index][1]
+        # If possible, concatenate a pure insert with the previous one.
+        if index == 0:
+            merge = False
+        else:
+            merge = self[index - 1][0] + len(self[index - 1][2]) == first2
+        if merge:
+            index -= 1
+            self[index][1] += deleted2
+            self[index][2] += insert2
+        else:
+            self.insert(index, [first2, deleted2, insert2, user2])
+        # FIXME!
+        # The new modification exists at INDEX.  Now, simplify forward.
+
+    def add_cautious(self, first2, deleted2, insert2, user2):
+        """\
+Add a triplet to a Canonical, being cautious to not lose anything:
+deletes are done once at most, previous inserts are never deleted.
+This is for modification sets coming from different users.
+"""
+        pass   # FIXME!
+
+    def relocate(self, first2, deleted2, insert2):
+        "Return FIRST2 as it should be if this Canonical was applied first."
+        after2 = first2 + len(insert2)
+        for first, deleted, insert, user in self:
+            # Nothing to do if the command appears later in the buffer.
+            if after2 > first:
+                after = first + len(insert)
+                if first2 > after:
+                    # Merely shift if the command appears sooner.
+                    delta = after2 - first - deleted
+                    first2 += delta
+                else:
+                    # FIXME!
+                    pass
+        return first2
+
+
 class Client(gevent.Greenlet):
-    user = None
+    "Receive all requests from a single client.  Produce a reply for each."
+    ordinal = 0
+    registry = {}
+    login = None
 
     def __init__(self, handle, host, port):
         super(Client, self).__init__()
+        self.ordinal = Client.ordinal
+        Client.ordinal += 1
+        Client.registry[self.ordinal] = self
         self.input = handle.makefile()
         self.output = handle.makefile('w', 0)
         self.host = host
@@ -123,13 +190,10 @@ class Client(gevent.Greenlet):
         self.outgoing_queue = []
 
     def __repr__(self):
-        if self.user is None:
-            text = ''
-        else:
-            text = '%s ' % self.user.name
-        if self.host != '127.0.0.1':
-            text += '%s ' % self.host
-        return '%s:%d' % (text, self.port)
+        return '%s@%s:%d' % (
+            '<?>' if self.login is None else self.login,
+            'localhost' if self.host == localhost else self.host,
+            self.port)
 
     def _run(self):
 
@@ -159,8 +223,8 @@ class Client(gevent.Greenlet):
 
         # Leave all resources.
         for resource in Resource.registry.itervalues():
-            if self in resource.users:
-                resource.users.remove(self)
+            if self in resource.clients:
+                resource.clients.remove(self)
 
     def dispatch(self, command):
         if command and isinstance(command, list):
@@ -177,63 +241,62 @@ class Client(gevent.Greenlet):
         except TypeError, exception:
             raise Warn(str(exception))
 
-    def do_alter(self, resource, first, deleted, insert):
+    def do_alter(self, resource, first, deleted, insert, include_self=False):
         resource = self.resolve_resource(resource)
-        if self not in resource.users:
-            raise Error("Resource not monitored: %r" % resource)
+        if self not in resource.clients:
+            raise Error("Resource is not monitored: %r" % resource)
         resource.alter(first, deleted, insert)
-        for client in resource.users:
-            client.outgoing_queue.append(
-                ('alter', resource.ordinal, first, deleted, insert,
-                 self.user.ordinal))
+        for client in resource.clients:
+            if include_self or client is not self:
+                client.outgoing_queue.append(
+                    ('alter', resource.ordinal, first, deleted, insert,
+                     self.ordinal))
         return 'done'
 
     def do_chat(self, user, insert):
-        user = self.resolve_user(user)
-        user.outgoing_queue.append(['chat', self.user.ordinal, insert])
+        client = self.resolve_user(user)
+        client.outgoing_queue.append(['chat', self.ordinal, insert])
         return 'done'
 
     def do_create(self, name):
         if not isinstance(name, (str, unicode)):
             raise Warn("Name should be a string: %r" % name)
         if Resource.get(name) is not None:
-            raise Warn("Resource name already taken: %r" % name)
+            raise Warn("Resource name is already taken: %r" % name)
         resource = Resource(name)
-        resource.users.append(self)
+        resource.clients.append(self)
         return ['done', resource.ordinal]
 
     def do_join(self, resource, md5sum):
         resource = self.resolve_resource(resource)
-        if self in resource.users:
+        if self in resource.clients:
             raise Warn("Already monitoring: %r" % resource)
         if md5sum == md5_empty:
             self.outgoing_queue.append(
                 ('alter', resource.ordinal, 0, 0, resource.get_contents(), 0))
         elif md5sum != resource.md5sum():
-            raise Warn("Checksum mismatch: %r %s here, %s remotely."
+            raise Warn("Checksums do not match: %r %s here, %s remotely."
                        % (resource, resource.md5sum(), md5sum))
-        resource.users.append(self)
+        resource.clients.append(self)
         return ['done', resource.ordinal]
 
     def do_leave(self, resource):
         resource = self.resolve_resource(resource)
-        if self not in resource.users:
+        if self not in resource.clients:
             raise Warn("Was not monitoring: %r" % resource)
-        resource.users.remove(self)
+        resource.clients.remove(self)
         return 'done'
 
     def do_login(self, name):
         if not isinstance(name, (str, unicode)):
-            raise Warn("Name should be a string: %r" % name)
-        self.user = User.get(name)
-        if self.user is None:
-            self.user = User(name)
-        return ['done', self.user.ordinal]
+            raise Warn("Login name should be a string: %r" % name)
+        self.login = name
+        return ['done', self.ordinal]
 
     def do_logout(self):
-        if self.user is None:
+        if self.login is None:
             raise Warn("Not logged in: %r" % self)
-        del self.user
+        del self.login
         return 'done'
 
     def do_resources(self):
@@ -242,46 +305,73 @@ class Client(gevent.Greenlet):
             for key, resource in sorted(Resource.registry.items())]
 
     def do_poll(self, *subcommands):
-        undos = []
-        redos = []
+        # Group incoming commands into canonicals, according to resources.
+        incoming_by_resource = {}
         for command in subcommands:
             if command[0] == 'alter':
                 _, resource, first, deleted, insert = command
-                after = first + len(insert)
-                undos.append(['alter', resource, first, len(insert),
-                              deleted, self.user.ordinal])
-                for command_0 in self.outgoing_queue:
-                    if command_0[0] == 'alter' and command_0[1] == resource:
-                        # COMMAND_0 should have been done first: so fine tune
-                        # COMMAND to account for this chronological error.
-                        _, _, first_0, end_0, insert_0, _ = command_0
-                        # Nothing to do when COMMAND_0 appears textually
-                        # later in the buffer.
-                        if after > first_0:
-                            after_0 = first_0 + len(insert_0)
-                            if first > after_0:
-                                # Merely shift if COMMAND_0 appears sooner.
-                                delta = after_0 - end_0
-                                first += delta
-                            else:
-                                # There is a clash.  Delete characters no more
-                                # than once and make sure to keep both inserts.
-                                # FIXME:
-                                pass
-                redos.append(['alter', resource, first, deleted, insert])
-        for command in redos:
-            self.dispatch(command)
-        undos.reverse()
-        queue = undos + self.outgoing_queue
+                incoming = incoming_by_resource.get(resource)
+                if incoming is None:
+                    incoming = incoming_by_resource[resource] = Canonical()
+                incoming.add_straight(first, deleted, insert, None)
+            else:
+                raise Error("Expecting an alter command: %r" % command)
+        # Group outgoing commands into canonicals, according to resources.
+        outgoing_by_resource = {}
+        outgoing_queue = []
+        for command in self.outgoing_queue:
+            if command[0] == 'alter':
+                _, resource, first, deleted, insert, user = command
+                outgoing = outgoing_by_resource.get(resource)
+                if outgoing is None:
+                    outgoing = outgoing_by_resource[resource] = Canonical()
+                outgoing.add_straight(first, deleted, insert, user)
+            else:
+                outgoing_queue.append(command)
         self.outgoing_queue = []
-        if queue:
-            return ['exec'] + queue
+        # Handle each resource separately.
+        for resource in set(incoming_by_resource) | set(outgoing_by_resource):
+            incoming = incoming_by_resource.get(resource)
+            outgoing = outgoing_by_resource.get(resource)
+            if outgoing is None:
+                # We only have INCOMING.
+                for first, deleted, insert, user in incoming:
+                    self.do_alter(resource, first, deleted, insert)
+            elif incoming is None:
+                # We only have OUTGOING.
+                for first, deleted, insert, user in outgoing:
+                    outgoing_queue.append(['alter', resource,
+                                           first, deleted, insert, user])
+            else:
+                # We have both INCOMING and OUTGOING.
+                undos = []
+                redos = []
+                for first, deleted, insert, user in incoming:
+                    undos.append(['alter', resource, first, len(insert),
+                                  deleted, self.ordinal])
+                    first = outgoing.relocate(first, deleted, insert)
+                    redos.append([first, deleted, insert])
+                for first, deleted, insert in redos:
+                    self.do_alter(resource, first, deleted, insert,
+                                  include_self=True)
+                undos.reverse()
+                outgoing_queue = undos + outgoing_queue
+        if outgoing_queue:
+            return ['exec'] + outgoing_queue
         return 'exec'
 
     def do_users(self):
         return ['done'] + [
-            [client.name, key]
-            for key, client in sorted(User.registry.items())]
+            [repr(client), key]
+            for key, client in sorted(Client.registry.items())]
+
+    @staticmethod
+    def get(name):
+        if isinstance(name, int):
+            return Client.registry.get(name)
+        for key, client in Client.registry.iteritems():
+            if name == client.name:
+                return client
 
     def report(self, format, *arguments):
         now = datetime.datetime.now().time()
@@ -289,16 +379,18 @@ class Client(gevent.Greenlet):
                    now.hour, now.minute, now.second, *arguments)
 
     def resolve_resource(self, resource):
+        "Return the Resource structure for a given RESOURCE name or number."
         found = Resource.get(resource)
         if found is None:
-            raise Warn("Resource not found: %r" % resource)
+            raise Warn("Resource is not found: %r" % resource)
         return found
 
     def resolve_user(self, user):
-        found = User.get(user)
-        if found is None:
-            raise Warn("User not found: %r" % user)
-        return found
+        "Return the Client structure for a given USER name or number."
+        client = Client.get(user)
+        if client is None:
+            raise Warn("User is not found: %r" % user)
+        return client
 
 
 class Resource:
@@ -311,7 +403,7 @@ class Resource:
         Resource.ordinal += 1
         Resource.registry[self.ordinal] = self
         self.contents = ''
-        self.users = []
+        self.clients = []
 
     def __repr__(self):
         return repr(self.name)
@@ -334,25 +426,6 @@ class Resource:
 
     def md5sum(self):
         return hashlib.md5(self.contents.encode(encoding)).hexdigest()
-
-
-class User:
-    ordinal = 0
-    registry = {}
-
-    def __init__(self, name):
-        self.name = name
-        self.ordinal = User.ordinal
-        User.ordinal += 1
-        User.registry[self.ordinal] = self
-
-    @staticmethod
-    def get(name):
-        if isinstance(name, int):
-            return User.registry.get(name)
-        for key, client in User.registry.iteritems():
-            if name == client.name:
-                return client
 
 
 run = Main()

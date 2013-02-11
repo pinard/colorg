@@ -26,12 +26,16 @@ Emacs Org mode users.  See https://github.com/pinard/colorg/wiki/.
 Usage: colorg-server [OPTION]... [HOST] [PORT]
 
 Options:
-  -d   Debug all communication (double to get the polling as well).
-  -h   Print this help, and do nothing else.
+  -d FLAGS   Debug according to FLAGS
+  -h         Print this help, and do nothing else.
 
 If HOST is specified, listen for connections on HOST instead of 0.0.0.0.
 If PORT is specified, listen for connections on PORT rather than on 7997.
 PORT being recognized as a decimal number, HOST may be omitted.
+
+Debug FLAGS is one or more letter among "p" (communication protocol),
+"e" (empty polls or execs in protocol) or "c" (modification of
+changesets).
 """
 
 __metaclass__ = type
@@ -47,6 +51,11 @@ welcome = 'colorg v1'
 encoding = 'UTF-8'
 md5_empty = 'd41d8cd98f00b204e9800998ecf8427e'
 localhost = '127.0.0.1'
+
+# Debug flags
+PROTO = 1
+EMPTY = 2
+CHSET = 4
 
 
 class Error(Exception):
@@ -67,10 +76,11 @@ class Main:
 
         # Decode options.
         import getopt
-        options, arguments = getopt.getopt(arguments, 'dh')
+        options, arguments = getopt.getopt(arguments, 'd:h')
         for option, value in options:
             if option == '-d':
-                self.debug += 1
+                for letter in value:
+                    self.debug |= {'p': PROTO, 'e': EMPTY, 'c': CHSET}[letter]
             elif option == '-h':
                 sys.stdout.write(__doc__)
                 return
@@ -107,64 +117,185 @@ class Main:
         sys.stderr.write('%s\n' % (format % arguments).rstrip())
 
 
-class Canonical(list):
+class Change:
     """\
-A Canonical is a sequence of [FIRST, DELETED, INSERT, USER] lists, for
-which all lists describe independant changes: there is no kind of
-overlap between them.  Moreover, inserts are concatenated when feasible.
-No two lists in a canonical sequence share the same FIRST field, and
-these are kept in increasing order within the sequence.
+A Change is specified by FIRST, DELETED, INSERT and USER.  The number
+FIRST is the zero-based position of the start of a change.  The
+changes removes DELETED characters starting from that position and
+replaces them with the string INSERT.  The change also records that it
+orginates by USER, identified by its user number.
+
+For programming convenience, a change also has a few read-only fields:
+  - LIMIT, which is the same as FIRST + DELETED;
+  - LAST, which is the same as FIRST + len(INSERT);
+  - DELTA, which is the same as len(INSERT) - DELETED.
+
+The change deletes Characters from position FIRST to position LIMIT
+(excluded), and the replacement text runs from postion FIRST to
+position LAST (excluded).  The effect of the change wholly extends the
+buffer by DELTA characters when DELTA is positive, or rather shrinks
+it by -DELTA characters whenever DELTA is negative.  We always have
+that DELTA equals LAST - LIMIT.
 """
 
-    def add_straight(self, first2, deleted2, insert2, user2):
-        """\
-Add a triplet to a Canonical, with strict obedience in case of clashes.
-This is for modification sets all originating from the same user.
+    def __init__(self, first, deleted, insert, user):
+        self.first = first
+        self.deleted = deleted
+        self.insert = insert
+        self.user = user
+
+    def __repr__(self):
+        text = repr(self.insert)
+        if text.startswith('u'):
+            text = text[1:]
+        return '%d-%d+%s' % (self.first, self.deleted, text[1:-1])
+
+    def get_delta(self):
+        return len(self.insert) - self.deleted
+
+    def get_last(self):
+        return self.first + len(self.insert)
+
+    def get_limit(self):
+        return self.first + self.deleted
+
+    delta = property(get_delta)
+    last = property(get_last)
+    limit = property(get_limit)
+
+
+class ChangeSet(list):
+    """\
+A changeset is a sequence of changes, kept sorted so they would apply
+from the beginning to the end.  The value of FIRST in any change in a
+changeset considers that all previous changes would have been already
+applied.  Changes do not overlap and do not even touch.  Formally
+stated, the value of FIRST in any change in a changeset is always
+strictly greater than the value of LAST for the preceding change.
 """
-        # Find INDEX where the new modification should be added or merged.
-        delta2 = len(insert2) - deleted2
+    debug_name = None
+
+    def __init__(self, resource, qualifier):
+        list.__init__(self)
+        self.resource = resource
+        self.qualifier = qualifier
+
+    def add(self, change):
+        """\
+Add CHANGE to a changeset.  If CHANGE.user is None, it is assumed that
+the change has to be applied verbatim, with strict obedience in case
+of clashes; this happens when modifications all originate from the
+same user.  If CHANGE.user is not None, the change must be applied
+cautiously so all work is preserved: deletes are done once at most and
+previous inserts are never deleted; which is the case when changes
+come from different users.
+"""
+        if run.debug & CHSET:
+            print "Entering add(%r)" % change
+            print self.dump('>')
+        self.check('> add')
+        verbatim = change.user is None
+        # The new change is added at the end, then gets percolated down.  While
+        # this is going, CHANGE is self[INDEX + 1] and PRIOR just below is
+        # self[INDEX].  Changes self[:INDEX + 1] and self[INDEX + 2:]) are kept
+        # clean.  CHANGE gets modified destructively in the process, so the
+        # caller should pass a copy if the original has to be preserved.
         index = len(self)
-        while index > 0 and first2 < self[index - 1][0]:
+        self.append(change)
+        while index > 0:
             index -= 1
-            self[index][0] += delta2
-            first2 -= len(self[index][2]) - self[index][1]
-        # If possible, concatenate a pure insert with the previous one.
-        if index == 0:
-            merge = False
-        else:
-            merge = self[index - 1][0] + len(self[index - 1][2]) == first2
-        if merge:
-            index -= 1
-            self[index][1] += deleted2
-            self[index][2] += insert2
-        else:
-            self.insert(index, [first2, deleted2, insert2, user2])
-        # FIXME!
-        # The new modification exists at INDEX.  Now, simplify forward.
+            prior = self[index]
+            if change.first > prior.last:
+                # CHANGE is already OK as it stands.
+                break
+            if change.first == prior.last:
+                # CHANGE merely concatenates after PRIOR.  Merge it in.
+                prior.insert += change.insert
+                prior.deleted += change.deleted
+                # User information is parly lost; this is innocuous.
+                del self[index + 1]
+                break
+            if not verbatim:
+                # FIXME: Should rather try to guess the user's intent!
+                self.shift_after(index + 1, change.deleted)
+                change.deleted = 0
+            if change.first >= prior.first:
+                # CHANGE is modifying PRIOR.insert.
+                left = prior.insert[:change.first - prior.first]
+                if change.limit < prior.last:
+                    # Insert CHANGE.insert within PRIOR.insert.
+                    right = prior.insert[change.limit - prior.first:]
+                    prior.insert = left + change.insert + right
+                else:
+                    # Concatenate CHANGE.insert after truncated PRIOR.insert.
+                    prior.insert = left + change.insert
+                    prior.deleted += change.limit - prior.last
+                del self[index + 1]
+                break
+            if change.limit >= prior.last:
+                # All of PRIOR.insert is getting deleted, so remove PRIOR.
+                change.deleted += prior.deleted - len(prior.insert)
+                del self[index]
+                continue
+            # CHANGE is likely to bubble down.
+            if change.limit >= prior.first:
+                # The initial part of PRIOR.insert is getting deleted.
+                removed = change.last - prior.first
+                prior.insert = prior.insert[removed:]
+                change.deleted -= removed
+            # There is no delete overlap, so relocate and exchange.
+            change.first -= prior.delta
+            prior.first += change.delta
+            if change.first <= prior.first:
+                # With negative deltas, order may happen to be OK: recheck!
+                index += 1
+                continue
+            self[index] = change
+            self[index + 1] = prior
+        if run.debug & CHSET:
+            print self.dump('<')
+            self.check('< add')
 
-    def add_cautious(self, first2, deleted2, insert2, user2):
-        """\
-Add a triplet to a Canonical, being cautious to not lose anything:
-deletes are done once at most, previous inserts are never deleted.
-This is for modification sets coming from different users.
-"""
-        pass   # FIXME!
+    def check(self, title=None):
+        "Check for a healthy changeset, else dump it within an Error."
+        last = -1
+        for change in self:
+            if change.first < 0 or change.deleted < 0 or change.first <= last:
+                raise Error(self.dump(title or "Invalid changeset"))
+            last = change.last
 
-    def relocate(self, first2, deleted2, insert2):
-        "Return FIRST2 as it should be if this Canonical was applied first."
-        after2 = first2 + len(insert2)
-        for first, deleted, insert, user in self:
-            # Nothing to do if the command appears later in the buffer.
-            if after2 > first:
-                after = first + len(insert)
-                if first2 > after:
-                    # Merely shift if the command appears sooner.
-                    delta = after2 - first - deleted
-                    first2 += delta
+    def dump(self, title):
+        "Produce a string representing the changeset, for debugging."
+        fragments = []
+        write = fragments.append
+        write(u'%s.%s %s ' % (self.resource, self.qualifier, title))
+        last = -1
+        for change in self:
+            write(' %r' % change)
+            if change.first < 0 or change.deleted < 0 or change.first <= last:
+                write(' ??')
+            last = change.last
+        return ''.join(fragments)
+
+    def reset_first(self, change):
+        "Set FIRST as it should be if this changeset was applied first."
+        for cursor in self:
+            # Nothing to do if the change appears later in the buffer.
+            if change.last > cursor.first:
+                if change.first > cursor.last:
+                    # Merely shift if the change appears sooner.
+                    delta = change.last - cursor.limit
+                    change.first += delta
                 else:
                     # FIXME!
                     pass
-        return first2
+
+    def shift_after(self, index, delta):
+        "For all of self[INDEX + 1:] changes, add DELTA to their FIRST value."
+        index += 1
+        while index < len(self):
+            self[index].first += delta
+            index += 1
 
 
 class Client(gevent.Greenlet):
@@ -172,6 +303,7 @@ class Client(gevent.Greenlet):
     ordinal = 0
     registry = {}
     login = None
+    last_reported = None
 
     def __init__(self, handle, host, port):
         super(Client, self).__init__()
@@ -182,16 +314,16 @@ class Client(gevent.Greenlet):
         self.output = handle.makefile('w', 0)
         self.host = host
         self.port = port
-        self.report("%r Incoming connection.", self)
+        self.report("> Incoming connection.")
         text = '"%s"' % welcome
-        if run.debug:
-            self.report("%s %s", ' ' * len(repr(self)), text)
+        if run.debug & PROTO:
+            self.report('< %s', text)
         self.output.write(text + '\n')
         self.outgoing_queue = []
 
     def __repr__(self):
         return '%s@%s:%d' % (
-            '<?>' if self.login is None else self.login,
+            '???' if self.login is None else self.login,
             'localhost' if self.host == localhost else self.host,
             self.port)
 
@@ -201,10 +333,10 @@ class Client(gevent.Greenlet):
         while True:
             line = self.input.readline()
             if not line:
-                self.report("%r Disconnected.", self)
+                self.report("> Disconnected.")
                 break
-            if run.debug and (run.debug > 1 or line != '"poll"\n'):
-                self.report("%r %s", self, line.rstrip())
+            if run.debug & PROTO and (run.debug & EMPTY or line != '"poll"\n'):
+                self.report('> %s', line.rstrip())
             try:
                 try:
                     command = json.loads(line)
@@ -217,8 +349,8 @@ class Client(gevent.Greenlet):
                 result = ['warn', str(exception)]
             text = json.dumps(result)
             assert '\n' not in text, repr(text)
-            if run.debug and (run.debug > 1 or text != '"exec"'):
-                self.report("%s %s", ' ' * len(repr(self)), text)
+            if run.debug & PROTO and (run.debug & EMPTY or text != '"exec"'):
+                self.report('< %s', text)
             self.output.write(text + '\n')
 
         # Leave all resources.
@@ -291,12 +423,14 @@ class Client(gevent.Greenlet):
         if not isinstance(name, (str, unicode)):
             raise Warn("Login name should be a string: %r" % name)
         self.login = name
+        Client.last_reported = None
         return ['done', self.ordinal]
 
     def do_logout(self):
         if self.login is None:
             raise Warn("Not logged in: %r" % self)
         del self.login
+        Client.last_reported = None
         return 'done'
 
     def do_resources(self):
@@ -305,18 +439,19 @@ class Client(gevent.Greenlet):
             for key, resource in sorted(Resource.registry.items())]
 
     def do_poll(self, *subcommands):
-        # Group incoming commands into canonicals, according to resources.
+        # Group incoming commands into changesets, one per resource.
         incoming_by_resource = {}
         for command in subcommands:
             if command[0] == 'alter':
                 _, resource, first, deleted, insert = command
                 incoming = incoming_by_resource.get(resource)
                 if incoming is None:
-                    incoming = incoming_by_resource[resource] = Canonical()
-                incoming.add_straight(first, deleted, insert, None)
+                    incoming = incoming_by_resource[resource] = ChangeSet(
+                        resource, 'incoming')
+                incoming.add(Change(first, deleted, insert, None))
             else:
                 raise Error("Expecting an alter command: %r" % command)
-        # Group outgoing commands into canonicals, according to resources.
+        # Group outgoing commands into changesets, one per resource.
         outgoing_by_resource = {}
         outgoing_queue = []
         for command in self.outgoing_queue:
@@ -324,8 +459,9 @@ class Client(gevent.Greenlet):
                 _, resource, first, deleted, insert, user = command
                 outgoing = outgoing_by_resource.get(resource)
                 if outgoing is None:
-                    outgoing = outgoing_by_resource[resource] = Canonical()
-                outgoing.add_straight(first, deleted, insert, user)
+                    outgoing = outgoing_by_resource[resource] = ChangeSet(
+                        resource, 'outgoing')
+                outgoing.add(Change(first, deleted, insert, user))
             else:
                 outgoing_queue.append(command)
         self.outgoing_queue = []
@@ -335,25 +471,28 @@ class Client(gevent.Greenlet):
             outgoing = outgoing_by_resource.get(resource)
             if outgoing is None:
                 # We only have INCOMING.
-                for first, deleted, insert, user in incoming:
-                    self.do_alter(resource, first, deleted, insert)
+                for change in incoming:
+                    self.do_alter(
+                        resource, change.first, change.deleted, change.insert)
             elif incoming is None:
                 # We only have OUTGOING.
-                for first, deleted, insert, user in outgoing:
-                    outgoing_queue.append(['alter', resource,
-                                           first, deleted, insert, user])
+                for change in outgoing:
+                    outgoing_queue.append(
+                        ['alter', resource, change.first, change.deleted,
+                         change.insert, change.user])
             else:
                 # We have both INCOMING and OUTGOING.
                 undos = []
                 redos = []
-                for first, deleted, insert, user in incoming:
-                    undos.append(['alter', resource, first, len(insert),
-                                  deleted, self.ordinal])
-                    first = outgoing.relocate(first, deleted, insert)
-                    redos.append([first, deleted, insert])
-                for first, deleted, insert in redos:
-                    self.do_alter(resource, first, deleted, insert,
-                                  include_self=True)
+                for change in incoming:
+                    undos.append([
+                        'alter', resource, change.first, len(change.insert),
+                        change.deleted, self.ordinal])
+                    outgoing.reset_first(change)
+                    redos.append(change)
+                for change in redos:
+                    self.do_alter(resource, change.first, change.deleted,
+                                  change.insert, include_self=True)
                 undos.reverse()
                 outgoing_queue = undos + outgoing_queue
         if outgoing_queue:
@@ -374,8 +513,11 @@ class Client(gevent.Greenlet):
                 return client
 
     def report(self, format, *arguments):
+        if Client.last_reported is not self:
+            run.report('%r', self)
+            Client.last_reported = self
         now = datetime.datetime.now().time()
-        run.report('%.2d:%.2d:%.2d ' + format,
+        run.report('  %.2d:%.2d:%.2d ' + format,
                    now.hour, now.minute, now.second, *arguments)
 
     def resolve_resource(self, resource):

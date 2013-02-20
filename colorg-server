@@ -173,7 +173,6 @@ applied.  Changes do not overlap and do not even touch.  Formally
 stated, the value of FIRST in any change in a changeset is always
 strictly greater than the value of LAST for the preceding change.
 """
-    debug_name = None
 
     def __init__(self, resource, qualifier):
         list.__init__(self)

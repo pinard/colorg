@@ -28,6 +28,7 @@ Usage: colorg-server [OPTION]... [HOST] [PORT]
 Options:
   -d FLAGS   Debug according to FLAGS
   -h         Print this help, and do nothing else.
+  -q         Be quiet, print only errors.
 
 If HOST is specified, listen for connections on HOST instead of 0.0.0.0.
 If PORT is specified, listen for connections on PORT rather than on 7997.
@@ -70,13 +71,14 @@ class Main:
     debug = 0
     host = '0.0.0.0'
     port = 7997
+    verbose = True
 
     def main(self, *arguments):
         "Main entry point."
 
         # Decode options.
         import getopt
-        options, arguments = getopt.getopt(arguments, 'd:h')
+        options, arguments = getopt.getopt(arguments, 'd:hq')
         for option, value in options:
             if option == '-d':
                 for letter in value:
@@ -84,6 +86,8 @@ class Main:
             elif option == '-h':
                 sys.stdout.write(__doc__)
                 return
+            elif option == '-q':
+                self.verbose = False
         if len(arguments) == 1 and arguments[0].isdigit():
             self.port = int(arguments[0])
         else:
@@ -107,8 +111,9 @@ class Main:
         handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         handle.bind((self.host, self.port))
         handle.listen(1)
-        self.report("colorg server accepting connections on %s, port %d.",
-                    self.host, self.port)
+        if self.verbose:
+            self.report("colorg server accepting connections on %s, port %d.",
+                        self.host, self.port)
         while True:
             handle2, address = handle.accept()
             Client(handle2, *address).start()
@@ -313,7 +318,8 @@ class Client(gevent.Greenlet):
         self.output = handle.makefile('w', 0)
         self.host = host
         self.port = port
-        self.report("> Incoming connection.")
+        if run.verbose:
+            self.report("> Incoming connection.")
         text = '"%s"' % welcome
         if run.debug & PROTO:
             self.report('< %s', text)
@@ -332,7 +338,8 @@ class Client(gevent.Greenlet):
         while True:
             line = self.input.readline()
             if not line:
-                self.report("> Disconnected.")
+                if run.verbose:
+                    self.report("> Disconnected.")
                 break
             if run.debug & PROTO and (run.debug & EMPTY or line != '"poll"\n'):
                 self.report('> %s', line.rstrip())

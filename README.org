@@ -1,16 +1,34 @@
 #+TITLE: colorg — Collaborative tools for Emacs Org
 #+OPTIONS: H:2
-#+INCLUDE: "~/fp/notes/setup/nodemacs.org"
-* |
 
-  *This project should soon be usable, but not yet.  Adventurous people are invited to try it nevertheless, then share their ideas or findings!*
+  *This project is not yet usable.  Adventurous people are invited to
+  try it nevertheless, then share their ideas or findings!*
 
-The *colorg* project is about real-time collaboration between Emacs users.  Many contributors may work at once on a /resource/, which is nothing more than a shared buffer contents, each contributor having a local copy of that resource in an Emacs buffer.  Modifications made by any contributor is reflected to all other contributors, nearly in real-time.
+The *colorg* project is about real-time collaboration between Emacs
+users.  Many contributors may work at once on a /resource/, which is
+nothing more than a shared buffer contents, each contributor having a
+local copy of that resource in an Emacs buffer.  Modifications made by
+any contributor is reflected to all other contributors, nearly in
+real-time.
 
-The project name reflects the original incentive towards Org files and Emacs Org mode, yet the tool may synchronize buffers using other modes just as well.  The project is meant to eventually offer special comfort to Org users, for a few Org specific operations.
+The project name reflects the original incentive towards Org files and
+Emacs Org mode, yet the tool may synchronize buffers using other modes
+just as well.  The project is meant to eventually offer special
+comfort to Org users, for a few Org specific operations.
 
-Collaborating users should direct their Emacs client to connect to a common *colorg* server, which is also included in the *colorg* distribution.  That server is required, as there is no direct connection between two Emacses.  Each group of collaborators is invited to decide between them who starts the server they need, or else, to select some server already running outside their gang.  The project is not oriented towards a centralized cloud offering or Web service.
+Collaborating users should direct their Emacs client to connect to a
+common *colorg* server, which is also included in the *colorg*
+distribution.  That server is required, as there is no direct
+connection between two Emacses.  Each group of collaborators is
+invited to decide between them who starts the server they need, or
+else, to select some server already running outside their gang.  The
+project is not oriented towards a centralized cloud offering or Web
+service.
 
-The [[https://github.com/pinard/colorg/wiki][colorg Wiki]] contains exchanges taken from the Org mailing list, ongoing pointers, related matters, as well as installation and usage [[https://github.com/pinard/colorg/wiki/Usage][instructions]].  Comments, bug reports or suggestions may be sent to [[mailto:pinard@progiciels-bpi.ca][the author]] directly by email, or through the nice GitHub [[https://github.com/pinard/colorg/issues][issue system]] if you are comfortable with it.
+The [[https://github.com/pinard/colorg/wiki][colorg Wiki]] contains exchanges taken from the Org mailing list,
+ongoing pointers, related matters, as well as installation and usage
+[[https://github.com/pinard/colorg/wiki/Usage][instructions]].  Comments, bug reports or suggestions may be sent to [[mailto:pinard@progiciels-bpi.ca][the
+author]] directly by email, or through the nice GitHub [[https://github.com/pinard/colorg/issues][issue system]] if
+you are comfortable with it.
 
 François

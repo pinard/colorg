@@ -1,5 +1,7 @@
 #+TITLE: colorg — Collaborative tools for Emacs Org
 #+OPTIONS: H:2
+#+INCLUDE: "~/fp/notes/setup/nodemacs.org"
+* |
 
   *This project should soon be usable, but not yet.  Adventurous people are invited to try it nevertheless, then share their ideas or findings!*
 

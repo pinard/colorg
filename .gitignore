@@ -1,16 +1,2 @@
-lib-cov
-*.seed
-*.log
-*.csv
-*.dat
-*.out
-*.pid
-*.gz
-
+*.pyc
 build
-dist
-logs
-pids
-results
-
-npm-debug.log
